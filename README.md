@@ -50,7 +50,6 @@ ws2_32.lib winmm.lib d3d11.lib d3dcompiler.lib iphlpapi.lib opus.lib libcrypto.l
 4. Click **Connect** – the application will send a secured greeting.
 5. Accept incoming calls when prompted.
 6. Use **Mute** to disable microphone transmission.
-7. Adjust audio processing parameters in the **Audio Processing** panel.
 
 The debug log shows connection status, packet statistics, and audio processor state.
 

@@ -5,10 +5,8 @@
 #include <numeric>
 #include <cmath>
 #include "advanced_audio_processor.h"
+#include "utility.h"
 
-// Constants
-static const float PI = 3.14159265358979323846f;
-static const float TWO_PI = 2.0f * PI;
 
 AudioProcessor::AudioProcessor() {
 }
@@ -77,19 +75,19 @@ void AudioProcessor::ProcessFrame(int16_t* audioData, int samples) {
     
     // Convert to float
     std::vector<float> floatData(samples);
-    Int16ToFloat(audioData, floatData.data(), samples);
+    AudioUtils::Int16ToFloat(audioData, floatData.data(), samples);
     
     // Process in float
     ProcessFrame(floatData.data(), samples);
     
     // Convert back to int16
-    FloatToInt16(floatData.data(), audioData, samples);
+    AudioUtils::FloatToInt16(floatData.data(), audioData, samples);
 }
 
 void AudioProcessor::ProcessFrame(float* audioData, int samples) {
     if (!audioData || samples <= 0) return;
     
-    int frames = samples / config.channels;
+    int frames = samples / NUM_CHANNELS;
     
     // Calculate input level
     float inputRMS = 0.0f;
@@ -100,7 +98,7 @@ void AudioProcessor::ProcessFrame(float* audioData, int samples) {
     
     {
         std::lock_guard<std::mutex> lock(statsMutex);
-        stats.inputLevel = LinearToDb(inputRMS + 1e-10f);
+        stats.inputLevel = AudioUtils::LinearToDb(inputRMS + 1e-10f);
     }
     
     // 1. DC Offset Removal (first to prevent low-frequency artifacts)
@@ -152,7 +150,7 @@ void AudioProcessor::ProcessFrame(float* audioData, int samples) {
     
     {
         std::lock_guard<std::mutex> lock(statsMutex);
-        stats.outputLevel = LinearToDb(outputRMS + 1e-10f);
+        stats.outputLevel = AudioUtils::LinearToDb(outputRMS + 1e-10f);
     }
 }
 
@@ -160,10 +158,10 @@ void AudioProcessor::ProcessFrame(float* audioData, int samples) {
 // DC OFFSET REMOVAL
 // ============================================================================
 void AudioProcessor::ApplyDCRemoval(float* audioData, int samples) {
-    for (int ch = 0; ch < config.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         float* state = &dcState[ch];
         
-        for (int i = ch; i < samples; i += config.channels) {
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             float input = audioData[i];
             float output = input - *state;
             *state = config.dcRemovalAlpha * *state + (1.0f - config.dcRemovalAlpha) * input;
@@ -176,7 +174,7 @@ void AudioProcessor::ApplyDCRemoval(float* audioData, int samples) {
 // BIQUAD FILTERS
 // ============================================================================
 void AudioProcessor::CalculateHighPassCoeffs() {
-    float fc = config.highPassFreq / config.sampleRate;
+    float fc = config.highPassFreq / SAMPLE_RATE;
     float Q = 0.707f;  // Butterworth
     
     float w0 = TWO_PI * fc;
@@ -195,7 +193,7 @@ void AudioProcessor::CalculateHighPassCoeffs() {
 }
 
 void AudioProcessor::CalculateLowPassCoeffs() {
-    float fc = config.lowPassFreq / config.sampleRate;
+    float fc = config.lowPassFreq / SAMPLE_RATE;
     float Q = 0.707f;
     
     float w0 = TWO_PI * fc;
@@ -251,47 +249,64 @@ void AudioProcessor::ApplyLowPassFilter(float* audioData, int samples) {
 // AUTOMATIC GAIN CONTROL (AGC)
 // ============================================================================
 void AudioProcessor::ApplyAGC(float* audioData, int samples) {
-    float targetLinear = DbToLinear(config.agcTargetLevel);
-    float maxGainLinear = DbToLinear(config.agcMaxGain);
-    float minGainLinear = DbToLinear(config.agcMinGain);
+    float targetLinear = AudioUtils::DbToLinear(config.agcTargetLevel);
+    // Ограничиваем максимальное усиление +16 dB (40x)
+    float maxGainLinear = AudioUtils::DbToLinear(16.0f);
+    float minGainLinear = AudioUtils::DbToLinear(-12.0f);
 
-    float attackCoeff = 1.0f - expf(-1000.0f / (config.agcAttack * config.sampleRate / (samples / config.channels + 1)));
-    float releaseCoeff = 1.0f - expf(-1000.0f / (config.agcRelease * config.sampleRate / (samples / config.channels + 1)));
+    // Коэффициенты атаки и спада для огибающей RMS
+    float attackCoeff = 1.0f - expf(-1000.0f / (config.agcAttack * SAMPLE_RATE / (samples / NUM_CHANNELS + 1)));
+    float releaseCoeff = 1.0f - expf(-1000.0f / (config.agcRelease * SAMPLE_RATE / (samples / NUM_CHANNELS + 1)));
 
-    for (int ch = 0; ch < config.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         AGCState* state = &agcState[ch];
 
-        float sum = 0.0f; int count = 0;
-        for (int i = ch; i < samples; i += config.channels) {
-            sum += audioData[i] * audioData[i];
+        // Вычисляем RMS текущего кадра
+        float rms = 0.0f;
+        int count = 0;
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
+            rms += audioData[i] * audioData[i];
             count++;
         }
-        float rms = sqrtf(sum / (count + 1e-8f));
+        rms = sqrtf(rms / (count + 1e-8f));
 
+        // Обновляем огибающую RMS
         if (rms > state->envelope)
             state->envelope += attackCoeff * (rms - state->envelope);
         else
             state->envelope += releaseCoeff * (rms - state->envelope);
 
-        float dynamicTarget = (rms < DbToLinear(-48.0f)) ? DbToLinear(-10.0f) : targetLinear;
-
-        if (state->envelope > 1e-6f) {
-            state->targetGain = dynamicTarget / state->envelope;
-            state->targetGain = std::max(minGainLinear, std::min(maxGainLinear, state->targetGain));
-            state->targetGain = std::min(state->targetGain, DbToLinear(16.0f));   // максимум +16 dB
+        // Динамический целевой уровень: для очень тихих участков усиляем сильнее
+        float dynamicTarget = targetLinear;
+        if (rms < AudioUtils::DbToLinear(-45.0f)) {
+            dynamicTarget = AudioUtils::DbToLinear(-10.0f);   // целевой -10 dB
         }
 
-        state->currentGain += (state->targetGain - state->currentGain) * attackCoeff;
-        state->currentGain = std::max(state->currentGain, DbToLinear(-8.0f));   // никогда ниже -8 dB
+        // Вычисляем желаемое усиление
+        float targetGain = dynamicTarget / (state->envelope + 1e-8f);
+        targetGain = std::max(minGainLinear, std::min(maxGainLinear, targetGain));
 
-        for (int i = ch; i < samples; i += config.channels) {
+        // Сглаживание изменения усиления (атака быстрее, спад медленнее)
+        float gainSmooth = 0.2f;
+        if (targetGain > state->currentGain) {
+            // Атака: быстрее поднимаем уровень
+            state->currentGain += gainSmooth * (targetGain - state->currentGain);
+        }
+        else {
+            // Спад: очень медленно опускаем, чтобы не создавать щелчков
+            state->currentGain += 0.05f * (targetGain - state->currentGain);
+        }
+        state->currentGain = std::max(minGainLinear, std::min(maxGainLinear, state->currentGain));
+
+        // Применяем усиление
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             audioData[i] *= state->currentGain;
         }
     }
 
     {
         std::lock_guard<std::mutex> lock(statsMutex);
-        stats.currentGain = LinearToDb(agcState[0].currentGain);
+        stats.currentGain = AudioUtils::LinearToDb(agcState[0].currentGain);
     }
 }
 // ============================================================================
@@ -300,7 +315,7 @@ void AudioProcessor::ApplyAGC(float* audioData, int samples) {
 void AudioProcessor::ApplyNoiseSuppression(float* audioData, int samples) {
     // Use simple time-domain noise suppression for low latency
     SimpleNoiseSuppression(audioData, samples, 0);
-    if (config.channels > 1) {
+    if (NUM_CHANNELS > 1) {
         SimpleNoiseSuppression(audioData, samples, 1);
     }
 }
@@ -313,7 +328,7 @@ void AudioProcessor::SimpleNoiseSuppression(float* audioData, int samples, int c
     
     float noiseGate = state->noiseEstimate * config.noiseSuppressionLevel;
     
-    for (int i = channel; i < samples; i += config.channels) {
+    for (int i = channel; i < samples; i += NUM_CHANNELS) {
         float input = audioData[i];
         float inputAbs = fabsf(input);
         
@@ -327,7 +342,7 @@ void AudioProcessor::SimpleNoiseSuppression(float* audioData, int samples, int c
     
     {
         std::lock_guard<std::mutex> lock(statsMutex);
-        stats.noiseEstimate = LinearToDb(state->noiseEstimate + 1e-10f);
+        stats.noiseEstimate = AudioUtils::LinearToDb(state->noiseEstimate + 1e-10f);
         stats.suppressionAmount = config.noiseSuppressionLevel;
     }
 }
@@ -337,10 +352,10 @@ void AudioProcessor::UpdateNoiseEstimate(const float* audioData, int samples, in
     
     // Calculate frame energy
     float energy = 0.0f;
-    for (int i = channel; i < samples; i += config.channels) {
+    for (int i = channel; i < samples; i += NUM_CHANNELS) {
         energy += audioData[i] * audioData[i];
     }
-    energy = sqrtf(energy / (samples / config.channels));
+    energy = sqrtf(energy / (samples / NUM_CHANNELS));
     
     // Track energy history
     state->energyHistory.push_back(energy);
@@ -364,46 +379,53 @@ void AudioProcessor::UpdateNoiseEstimate(const float* audioData, int samples, in
 // DE-ESSER (for crackling/harsh sibilance)
 // ============================================================================
 void AudioProcessor::ApplyDeesser(float* audioData, int samples) {
-    float thresholdLinear = DbToLinear(config.deesserThreshold);
-    float ratio = config.deesserRatio;
-    
-    // Simple high-frequency envelope detection
-    float attackCoeff = 0.1f;
-    float releaseCoeff = 0.01f;
-    
-    for (int ch = 0; ch < config.channels; ch++) {
+    float thresholdLinear = AudioUtils::DbToLinear(config.deesserThreshold);
+    float ratio = config.deesserRatio;            // обычно 2.0 – 4.0
+    float attack = 0.1f;     // быстрая атака
+    float release = 0.02f;   // медленный спад, чтобы не было свиста
+
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         DeesserState* state = &deesserState[ch];
-        
-        for (int i = ch; i < samples; i += config.channels) {
+
+        // Простой фильтр верхних частот для выделения сибилянтов (~6 кГц)
+        // Используем разность между соседними отсчётами (high-pass 1-го порядка)
+        float envelope = state->envelope;
+        float gain = state->gain;
+
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             float input = audioData[i];
-            
-            // High-frequency content detection (simple difference)
+            // Эмуляция high-pass: вычитаем предыдущий отсчёт
             float highFreq = input;
-            if (i >= config.channels) {
-                highFreq = input - audioData[i - config.channels];
+            if (i >= NUM_CHANNELS) {
+                highFreq = input - audioData[i - NUM_CHANNELS];
             }
-            float highFreqAbs = fabsf(highFreq);
-            
-            // Envelope follower
-            if (highFreqAbs > state->envelope) {
-                state->envelope += attackCoeff * (highFreqAbs - state->envelope);
-            } else {
-                state->envelope += releaseCoeff * (highFreqAbs - state->envelope);
-            }
-            
-            // Compression for high frequencies
+            float absHigh = fabsf(highFreq);
+
+            // Огибающая высокочастотной составляющей
+            if (absHigh > envelope)
+                envelope += attack * (absHigh - envelope);
+            else
+                envelope += release * (absHigh - envelope);
+
+            // Компрессия
             float targetGain = 1.0f;
-            if (state->envelope > thresholdLinear) {
-                float excess = state->envelope - thresholdLinear;
-                float compressed = excess / ratio;
-                targetGain = (thresholdLinear + compressed) / state->envelope;
+            if (envelope > thresholdLinear) {
+                float excess = envelope - thresholdLinear;
+                float compressed = thresholdLinear + excess / ratio;
+                targetGain = compressed / envelope;
+                // Ограничение глубины сжатия: не более -6 dB
+                targetGain = std::max(0.5f, targetGain);
             }
-            
-            // Smooth gain
-            state->gain += 0.1f * (targetGain - state->gain);
-            
-            audioData[i] = input * state->gain;
+
+            // Сглаживание gain
+            gain += 0.05f * (targetGain - gain);
+            gain = std::max(0.5f, std::min(1.0f, gain));
+
+            audioData[i] = input * gain;
         }
+
+        state->envelope = envelope;
+        state->gain = gain;
     }
 }
 
@@ -411,15 +433,15 @@ void AudioProcessor::ApplyDeesser(float* audioData, int samples) {
 // SOFT LIMITER (prevent clipping)
 // ============================================================================
 void AudioProcessor::ApplyLimiter(float* audioData, int samples) {
-    float thresholdLinear = DbToLinear(config.limiterThreshold);
-    float releaseCoeff = 1.0f - expf(-1000.0f / (config.limiterRelease * config.sampleRate));
+    float thresholdLinear = AudioUtils::DbToLinear(config.limiterThreshold);
+    float releaseCoeff = 1.0f - expf(-1000.0f / (config.limiterRelease * SAMPLE_RATE));
     
-    for (int ch = 0; ch < config.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         LimiterState* state = &limiterState[ch];
         
         // Find peak in this frame
         float peak = 0.0f;
-        for (int i = ch; i < samples; i += config.channels) {
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             peak = std::max(peak, fabsf(audioData[i]));
         }
         
@@ -440,7 +462,7 @@ void AudioProcessor::ApplyLimiter(float* audioData, int samples) {
         state->gain += 0.5f * (targetGain - state->gain);
         
         // Apply gain
-        for (int i = ch; i < samples; i += config.channels) {
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             audioData[i] *= state->gain;
         }
     }
@@ -449,105 +471,95 @@ void AudioProcessor::ApplyLimiter(float* audioData, int samples) {
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
-float AudioProcessor::DbToLinear(float db) {
-    return powf(10.0f, db / 20.0f);
-}
-
-float AudioProcessor::LinearToDb(float linear) {
-    return 20.0f * log10f(linear + 1e-10f);
-}
-
-void AudioProcessor::FloatToInt16(const float* input, int16_t* output, int samples) {
-    for (int i = 0; i < samples; i++) {
-        float sample = input[i];
-        // Soft clipping
-        if (sample > 1.0f) sample = 1.0f + tanhf(sample - 1.0f) * 0.1f;
-        if (sample < -1.0f) sample = -1.0f + tanhf(sample + 1.0f) * 0.1f;
-        
-        // Convert to int16
-        int32_t intSample = static_cast<int32_t>(sample * 32767.0f);
-        intSample = std::max(-32768, std::min(32767, intSample));
-        output[i] = static_cast<int16_t>(intSample);
-    }
-}
-
-void AudioProcessor::Int16ToFloat(const int16_t* input, float* output, int samples) {
-    for (int i = 0; i < samples; i++) {
-        output[i] = static_cast<float>(input[i]) / 32768.0f;
-    }
-}
 
 AudioProcessor::ProcessorStats AudioProcessor::GetStats() const {
     std::lock_guard<std::mutex> lock(statsMutex);
     return stats;
 }
 
-float AudioProcessor::CalculateRMS(const float* audioData, int samples) {
-    float sum = 0.0f;
-    for (int i = 0; i < samples; i++) {
-        sum += audioData[i] * audioData[i];
-    }
-    return sqrtf(sum / samples);
-}
-
-float AudioProcessor::CalculatePeak(const float* audioData, int samples) {
-    float peak = 0.0f;
-    for (int i = 0; i < samples; i++) {
-        peak = std::max(peak, fabsf(audioData[i]));
-    }
-    return peak;
-}
 // ============================================================================
 // NOISE GATE (для тихого голоса) - УЛУЧШЕННАЯ ВЕРСИЯ
 // ============================================================================
 void AudioProcessor::ApplyNoiseGate(float* audioData, int samples) {
-    float baseThreshold = DbToLinear(config.noiseGateThreshold);
-    float attackCoeff = 1.0f - expf(-1000.0f / (config.noiseGateAttack * config.sampleRate));
-    float releaseCoeff = 1.0f - expf(-1000.0f / (config.noiseGateRelease * config.sampleRate));
-    int holdSamples = static_cast<int>(config.noiseGateHold * config.sampleRate / 1000.0f);
+    float baseThreshold = AudioUtils::DbToLinear(config.noiseGateThreshold);
+    float attackCoeff = 1.0f - expf(-1000.0f / (config.noiseGateAttack * SAMPLE_RATE));
+    float releaseCoeff = 1.0f - expf(-1000.0f / (config.noiseGateRelease * SAMPLE_RATE));
+    // Очень плавное закрытие (медленный спад) для устранения щелчков
+    float smoothRelease = releaseCoeff * 0.2f;  // в 5 раз медленнее основного релиза
+    int holdSamples = static_cast<int>(config.noiseGateHold * SAMPLE_RATE / 1000.0f);
 
-    for (int ch = 0; ch < config.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         NoiseGateState* state = &ngState[ch];
+        // Дополнительная переменная для плавного затухания
+        float envelope = state->envelope;
+        float noiseEstimate = state->noiseEstimate;
+        int holdCount = state->holdCount;
+        bool isOpen = state->isOpen;
+        float gain = state->gain;
 
-        for (int i = ch; i < samples; i += config.channels) {
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             float input = audioData[i];
-            float inputAbs = fabsf(input);
+            float absInput = fabsf(input);
 
-            // Обновление огибающей
-            if (inputAbs > state->envelope)
-                state->envelope += attackCoeff * (inputAbs - state->envelope);
+            // Огибающая с разными постоянными для атаки и спада
+            if (absInput > envelope)
+                envelope += attackCoeff * (absInput - envelope);
             else
-                state->envelope += releaseCoeff * (inputAbs - state->envelope);
+                envelope += releaseCoeff * (absInput - envelope);
 
-            // Адаптивный порог
-            state->noiseEstimate = 0.94f * state->noiseEstimate + 0.06f * state->envelope;
-            float adaptiveThreshold = baseThreshold * (1.0f + 0.10f * state->noiseEstimate);
+            // Оценка фонового шума (медленное обновление)
+            noiseEstimate = 0.99f * noiseEstimate + 0.01f * envelope;
+            float adaptiveThreshold = baseThreshold * (1.0f + 0.1f * noiseEstimate);
 
-            // === УЛУЧШЕННАЯ логика с импульсным блокировщиком ===
-            bool isImpulse = (state->envelope > DbToLinear(-8.0f)) &&
-                (state->envelope / (state->noiseEstimate + 1e-8f) > 6.5f);
+            // Детектор импульсных помех (щелчки клавиатуры и т.п.)
+            bool isImpulse = (envelope > AudioUtils::DbToLinear(-12.0f)) &&
+                (envelope > adaptiveThreshold * 8.0f) &&
+                (envelope / (noiseEstimate + 1e-8f) > 10.0f);
 
             if (isImpulse) {
-                state->isOpen = false;
-                state->holdCount = 0;
-            }
-            else if (state->envelope > adaptiveThreshold) {
-                state->isOpen = true;
-                state->holdCount = holdSamples;
-            }
-            else if (state->holdCount > 0) {
-                state->holdCount--;
+                // Импульс – не открываем гейт
+                isOpen = false;
+                holdCount = 0;
+                // Резко уменьшаем усиление, но без щелчка
+                gain = 0.05f;
             }
             else {
-                state->isOpen = false;
+                if (envelope > adaptiveThreshold) {
+                    isOpen = true;
+                    holdCount = holdSamples;
+                }
+                else if (holdCount > 0) {
+                    holdCount--;
+                    if (holdCount == 0) {
+                        isOpen = false;
+                    }
+                }
+                else {
+                    isOpen = false;
+                }
             }
 
-            // Плавное применение усиления
-            float targetGain = state->isOpen ? 1.0f : 0.04f;
-            state->gain += (targetGain - state->gain) * (state->isOpen ? attackCoeff : releaseCoeff * 0.4f);
+            // Плавное изменение усиления
+            float targetGain = isOpen ? 1.0f : 0.05f;
+            if (isOpen) {
+                // Атака: быстрее открываем
+                gain += attackCoeff * (targetGain - gain);
+            }
+            else {
+                // Закрытие: очень плавное, экспоненциальное затухание
+                gain += smoothRelease * (targetGain - gain);
+            }
+            gain = std::max(0.02f, std::min(1.0f, gain));  // не ниже -34 dB
 
-            audioData[i] = input * state->gain;
+            audioData[i] = input * gain;
         }
+
+        // Сохраняем состояние
+        state->envelope = envelope;
+        state->noiseEstimate = noiseEstimate;
+        state->holdCount = holdCount;
+        state->isOpen = isOpen;
+        state->gain = gain;
     }
 
     {

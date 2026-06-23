@@ -41,7 +41,6 @@
 #include "optimized_settings.h"
 #include "advanced_audio_codec.h"
 #include "secure_channel.h"
-//#include "reliable_transport.h"
 #include "adaptive_bitrate.h"
 #include "network_monitor.h"
 #include "low_latency_buffer.h"
@@ -49,12 +48,15 @@
 #include "audio_processor.h"
 #include "advanced_audio_processor.h"
 #include "advanced_video_codec.h"
+// После существующих глобальных переменных
+#include "reliable_transport.h"
 
 #include "voice_detector.h"
 #include <tchar.h>
 #include <ws2ipdef.h>
 #include <WS2tcpip.h>
 #include <opus/opus.h>
+#include "audio_defs.h"
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -68,6 +70,7 @@
 #pragma comment(lib, "libssl.lib")
 
 
+
 // ============================================================================
 // НАСТРОЙКИ
 // ============================================================================
@@ -75,12 +78,6 @@ const int PORT = 12345;
 const int VIDEO_PORT = 12346;
 const int GREETING_PORT = 12347;
 const int CONNECTION_TIMEOUT = 30;
-
-// Оптимальные параметры для стерео 48кГц с шифрованием
-const int SAMPLE_RATE = 48000; //opus Sampling rates from 8 to 48 kHz
-const int NUM_CHANNELS = 2; 
-const int BITS_PER_SAMPLE = 16;
-const int BUFFER_DURATION_MS = 60;  // 10ms = 960 samples; opus x>2.5 && x<60 40 щк 60
 
 // Расчёт размера аудиоданных
 const int AUDIO_DATA_SIZE = SAMPLE_RATE * BUFFER_DURATION_MS / 1000 * (BITS_PER_SAMPLE / 8) * NUM_CHANNELS;
@@ -114,8 +111,9 @@ enum ConnectionStatus {
 extern OptimizedSettings gOptimizedSettings;
 std::unique_ptr<AdvancedVideoStreamManager> gAdvancedVideoStream;
 bool showOptimizationSettings = false;
-
+std::unique_ptr<SecureChannel> g_secureChannel;
 std::mutex g_audioMutex;
+std::unique_ptr<SecureChannel> g_greetingChannel;
 
 std::atomic<bool> isRunning{ false };
 std::atomic<bool> isConnected{ false };
@@ -156,11 +154,10 @@ struct AudioProcessingSettings {
     std::atomic<bool> deesserEnabled{ true };
     std::atomic<bool> limiterEnabled{ true };
 
-    // === КЛЮЧЕВЫЕ: Мягкие пороги ===
-    std::atomic<float> noiseGateThreshold{ -42.0f };  // Было -45, мягче
-    std::atomic<float> agcTargetLevel{ -18.0f };      // Чуть громче
-    std::atomic<float> noiseSuppressionLevel{ 0.5f }; // Было 0.7, мягче
-    std::atomic<float> deesserThreshold{ -15.0f };   // Было -25, мягче
+    std::atomic<float> noiseGateThreshold{ -48.0f };  // изменено
+    std::atomic<float> agcTargetLevel{ -16.0f };
+    std::atomic<float> noiseSuppressionLevel{ 0.55f }; // изменено
+    std::atomic<float> deesserThreshold{ -20.0f };     // изменено
 } g_audioSettings;
 
 // === UI ===
@@ -246,6 +243,24 @@ struct AudioDataType {};
 struct VideoDataType {};
 struct GreetingDataType {};
 
+
+
+std::unique_ptr<ReliableTransport> g_reliableTransport;
+std::unique_ptr<AdaptiveJitterBuffer> g_adaptiveJitterBuffer;
+std::unique_ptr<AdaptiveBitrateController> g_bitrateController;
+std::unique_ptr<AdvancedAudioCodec> g_audioCodec;   // для кодирования/декодирования
+
+// Очередь исходящих пакетов (потокобезопасная)
+//std::queue<ReliableTransport::NetworkPacket> g_sendQueue;
+std::queue<std::vector<uint8_t>> g_sendQueue;
+std::mutex g_sendQueueMutex;
+std::condition_variable g_sendQueueCV;
+std::thread g_networkSenderThread;
+std::atomic<bool> g_networkSenderRunning{ false };
+
+// Статистика для адаптивного битрейта
+std::chrono::steady_clock::time_point g_lastBitrateUpdate;
+
 // ============================================================================
 // ПРОТОТИПЫ ФУНКЦИЙ
 // ============================================================================
@@ -254,15 +269,11 @@ bool InitializeAudioProcessor();
 void ShutdownAudioProcessor();
 void ProcessAudioCapture(std::vector<int16_t>& audioData);
 void UpdateAudioProcessingSettings();
-void RenderAudioSettingsPanel();
-void RenderQualityPanel();
-
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-void InitializeSecureStreams();
 void StartConnection();
 void StopConnection();
 void CaptureAudio();
@@ -283,154 +294,22 @@ void AcceptConnection();
 void RejectConnection();
 bool CheckTargetReachable(const std::string& ip);
 void CleanupSecureStreams();
+void InitializeGreetingChannel();
 void SafeStopAllThreads();
 void SendGreetingResponse(const std::string& targetIP);
 
-// ============================================================================
-// SecureStream (оставляем для совместимости)
-// ============================================================================
-template<typename T>
-class SecureStream {
-private:
-    EVP_CIPHER_CTX* encrypt_ctx = nullptr;
-    EVP_CIPHER_CTX* decrypt_ctx = nullptr;
-    std::vector<uint8_t> hmac_key;
-    bool use_compression = false;
-    SOCKET* target_socket = nullptr;
-    sockaddr_in* target_addr = nullptr;
 
-    std::vector<uint8_t> calculate_hmac(const std::vector<uint8_t>& data, const std::vector<uint8_t>& key) {
-        std::vector<uint8_t> result(EVP_MAX_MD_SIZE);
-        unsigned int len = 0;
-        HMAC(EVP_sha256(), key.data(), key.size(), data.data(), data.size(), result.data(), &len);
-        result.resize(len);
-        return result;
+void InitializeGreetingChannel() {
+    g_greetingChannel = std::make_unique<SecureChannel>();
+    SecureChannel::ChannelConfig cfg;
+    cfg.algorithm = SecureChannel::EncryptionAlgorithm::AES_256_GCM;
+    cfg.preSharedKey = "VoiceApp2024SecureLocalNetwork!!"; // Используем тот же ключ, что и для аудио
+    if (!g_greetingChannel->Initialize(cfg)) {
+        AddDebugLog("ERROR: Failed to initialize greeting secure channel");
     }
-
-public:
-    sockaddr_in* get_target_addr() const { return target_addr; }
-    
-    SecureStream(SOCKET* socket, sockaddr_in* addr, bool compress = false)
-        : use_compression(compress), target_socket(socket), target_addr(addr) {
-        encrypt_ctx = EVP_CIPHER_CTX_new();
-        decrypt_ctx = EVP_CIPHER_CTX_new();
-
-        unsigned char key[32] = { 0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,
-                                 0xfe,0xdc,0xba,0x98,0x76,0x54,0x32,0x10,
-                                 0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
-                                 0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00 };
-        unsigned char iv[16] = { 0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,
-                                0x0f,0xed,0xcb,0xa9,0x87,0x65,0x43,0x21 };
-
-        EVP_EncryptInit_ex(encrypt_ctx, EVP_aes_256_cbc(), NULL, key, iv);
-        EVP_DecryptInit_ex(decrypt_ctx, EVP_aes_256_cbc(), NULL, key, iv);
-        hmac_key.resize(32, 0xAA);
+    else {
+        AddDebugLog("Greeting secure channel initialized (AES-256-GCM)");
     }
-
-    ~SecureStream() {
-        if (encrypt_ctx) EVP_CIPHER_CTX_free(encrypt_ctx);
-        if (decrypt_ctx) EVP_CIPHER_CTX_free(decrypt_ctx);
-    }
-
-    sockaddr_in* get_target_addr() { return target_addr; }
-    void set_target_addr(sockaddr_in* new_addr) { target_addr = new_addr; }
-
-    void send_secure(const std::vector<uint8_t>& data) {
-        if (!target_socket || *target_socket == INVALID_SOCKET) return;
-        try {
-            if (data.size() != AUDIO_DATA_SIZE) {
-                AddDebugLog("[SecureStream] Warning: unexpected data size");
-            }
-
-            std::vector<uint8_t> encrypted(data.size() + EVP_MAX_BLOCK_LENGTH);
-            int len = 0, final_len = 0;
-            EVP_EncryptUpdate(encrypt_ctx, encrypted.data(), &len, data.data(), data.size());
-            EVP_EncryptFinal_ex(encrypt_ctx, encrypted.data() + len, &final_len);
-            encrypted.resize(len + final_len);
-
-            if (encrypted.size() > MAX_PACKET_SIZE - 36) {
-                AddDebugLog("[SecureStream] Warning: encrypted data too large");
-            }
-
-            auto hmac = calculate_hmac(encrypted, hmac_key);
-            uint32_t data_size = htonl(encrypted.size());
-            std::vector<uint8_t> packet;
-            packet.reserve(sizeof(data_size) + encrypted.size() + hmac.size());
-            packet.insert(packet.end(), (uint8_t*)&data_size, (uint8_t*)&data_size + sizeof(data_size));
-            packet.insert(packet.end(), encrypted.begin(), encrypted.end());
-            packet.insert(packet.end(), hmac.begin(), hmac.end());
-
-            if (packet.size() > 1450) {
-                AddDebugLog("[SecureStream] Warning: packet size exceeds safe MTU");
-            }
-
-            sendto(*target_socket, (const char*)packet.data(), packet.size(), 0,
-                (sockaddr*)target_addr, sizeof(*target_addr));
-        }
-        catch (...) {
-            AddDebugLog("[SecureStream] send_secure exception");
-        }
-    }
-
-    std::vector<uint8_t> receive_secure(const std::vector<uint8_t>& packet) {
-        if (packet.size() < sizeof(uint32_t) + 32) {
-            AddDebugLog("[SecureStream] receive_secure: packet too small");
-            return {};
-        }
-
-        try {
-            uint32_t data_size;
-            memcpy(&data_size, packet.data(), sizeof(data_size));
-            data_size = ntohl(data_size);
-
-            if (data_size > packet.size() - sizeof(uint32_t) - 32 ||
-                data_size > AUDIO_DATA_SIZE + 32) {
-                AddDebugLog("[SecureStream] receive_secure: invalid data size");
-                return {};
-            }
-
-            std::vector<uint8_t> encrypted(packet.begin() + sizeof(uint32_t),
-                packet.begin() + sizeof(uint32_t) + data_size);
-            std::vector<uint8_t> hmac(packet.begin() + sizeof(uint32_t) + data_size, packet.end());
-
-            if (calculate_hmac(encrypted, hmac_key) != hmac) {
-                AddDebugLog("[SecureStream] HMAC verification failed");
-                return {};
-            }
-
-            std::vector<uint8_t> decrypted(encrypted.size() + EVP_MAX_BLOCK_LENGTH);
-            int len = 0, final_len = 0;
-            EVP_DecryptUpdate(decrypt_ctx, decrypted.data(), &len, encrypted.data(), encrypted.size());
-            EVP_DecryptFinal_ex(decrypt_ctx, decrypted.data() + len, &final_len);
-            decrypted.resize(len + final_len);
-
-            if (decrypted.size() != AUDIO_DATA_SIZE) {
-                AddDebugLog("[SecureStream] Warning: decrypted size mismatch");
-            }
-
-            return decrypted;
-        }
-        catch (...) {
-            AddDebugLog("[SecureStream] receive_secure exception");
-            return {};
-        }
-    }
-};
-
-SecureStream<AudioDataType>* secureAudioStream = nullptr;
-SecureStream<VideoDataType>* secureVideoStream = nullptr;
-SecureStream<GreetingDataType>* secureGreetingStream = nullptr;
-
-void InitializeSecureStreams() {
-    if (!secureAudioStream) secureAudioStream = new SecureStream<AudioDataType>(&udpSocket, &targetAddr, true);
-    if (!secureVideoStream) secureVideoStream = new SecureStream<VideoDataType>(&videoSocket, &targetAddr, true);
-    if (!secureGreetingStream) secureGreetingStream = new SecureStream<GreetingDataType>(&greetingSocket, &targetAddr, false);
-}
-
-void CleanupSecureStreams() {
-    delete secureAudioStream; secureAudioStream = nullptr;
-    delete secureVideoStream; secureVideoStream = nullptr;
-    delete secureGreetingStream; secureGreetingStream = nullptr;
 }
 
 // ============================================================================
@@ -458,16 +337,13 @@ bool InitializeAudioProcessor() {
     g_audioProcessor = std::make_unique<AdvancedAudioProcessor>();
     
     AdvancedAudioProcessor::AdvancedConfig config;
-    config.sampleRate = SAMPLE_RATE;
-    config.channels = NUM_CHANNELS;
-    config.frameSize = SAMPLE_RATE * BUFFER_DURATION_MS / 1000;
     config.enableNoiseGate = g_audioSettings.noiseGateEnabled.load();
     config.noiseGateThreshold = g_audioSettings.noiseGateThreshold.load();
     config.noiseGateAttack = 5.0f;
-    config.noiseGateRelease = 100.0f;
+    config.noiseGateRelease = 250.0f;
     config.enableAGC = g_audioSettings.agcEnabled.load();
     config.agcTargetLevel = g_audioSettings.agcTargetLevel.load();
-    config.agcMaxGain = 30.0f;
+    config.agcMaxGain = 100.0f;
     config.enableNoiseSuppression = g_audioSettings.noiseSuppressionEnabled.load();
     config.noiseSuppressionLevel = g_audioSettings.noiseSuppressionLevel.load();
     config.enableSpectralNS = true;
@@ -512,85 +388,6 @@ void UpdateAudioProcessingSettings() {
     InitializeAudioProcessor();
 }
 
-// ============================================================================
-// UI ПАНЕЛИ (НОВОЕ)
-// ============================================================================
-void RenderAudioSettingsPanel() {
-    if (!showAudioSettings) return;
-
-    ImGui::SetNextWindowSize(ImVec2(520 * globalUIScale, 720 * globalUIScale), ImGuiCond_FirstUseEver);
-    bool open = showAudioSettings;   // убираем atomic проблему
-    if (ImGui::Begin("Audio Processing Settings", &open)) {
-        showAudioSettings = open;
-
-        if (g_audioProcessor) {
-            auto& cfg = g_audioProcessor->advConfig;
-            auto& stats = g_audioProcessor->advStats;
-
-            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.4f, 1.0f), "ДИНАМИЧЕСКАЯ СИСТЕМА (всё подстраивается само)");
-            ImGui::Separator();
-
-            // Слайдеры (теперь работают)
-            ImGui::SliderFloat("Base Noise Gate (dB)", &cfg.noiseGateThreshold, -55.0f, -25.0f, "%.1f");
-            ImGui::SliderFloat("Base VAD Confidence", &cfg.vadThreshold, 0.20f, 0.55f, "%.2f");
-            ImGui::SliderFloat("Base AGC Target (dB)", &cfg.agcTargetLevel, -30.0f, -10.0f, "%.1f");
-            ImGui::SliderFloat("Noise Suppression", &cfg.nsReductionAmount, 0.3f, 1.0f, "%.2f");
-
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "ТЕКУЩИЕ ДИНАМИЧЕСКИЕ ЗНАЧЕНИЯ:");
-
-            ImGui::Text("Noise Gate: %.1f dB", cfg.dynamicNoiseGateThreshold);
-            ImGui::Text("VAD Confidence: %.2f", cfg.dynamicVADConfidence);
-            ImGui::Text("AGC Target: %.1f dB", cfg.dynamicAGCTargetLevel);
-            ImGui::Text("Voice Active: %s", stats.voiceActive ? "ДА (отправка)" : "НЕТ");
-            ImGui::Text("Voice Confidence: %.2f", stats.voiceConfidence);
-            ImGui::Text("Noise Gate Open: %s", stats.noiseGateOpen ? "ОТКРЫТ" : "ЗАКРЫТ");
-        }
-        else {
-            ImGui::Text("Audio processor not initialized yet");
-        }
-
-        ImGui::End();
-    }
-}
-void RenderQualityPanel() {
-    if (!showQualityPanel.load()) return;
-    
-    ImGui::SetNextWindowSize(ImVec2(300 * globalUIScale, 250 * globalUIScale));
-    bool isOpen = showQualityPanel.load();
-    if (ImGui::Begin("Quality Monitor", &isOpen, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize)) {
-        showQualityPanel.store(isOpen);
-        
-        if (g_voiceFramework) {
-            auto report = g_voiceFramework->GetQualityReport();
-            ImGui::Text("Network Quality");
-            ImGui::Separator();
-            ImGui::Text("Latency: %.1f ms", report.currentLatency);
-            ImGui::Text("Packet Loss: %.2f%%", report.packetLossRate * 100.0);
-            ImGui::Text("Jitter: %.1f ms", report.jitter);
-            ImGui::Text("Bitrate: %d kbps", report.currentBitrate / 1000);
-            ImGui::Text("Grade: %s", report.networkGrade.c_str());
-            
-            ImGui::Separator();
-            ImGui::Text("Audio Processing");
-            ImGui::Separator();
-            ImGui::Text("Input Level: %.1f dB", report.inputLevel);
-            ImGui::Text("Output Level: %.1f dB", report.outputLevel);
-            ImGui::Text("AGC Gain: %.1f dB", report.currentGain);
-            ImGui::Text("Noise Gate: %s", report.noiseGateOpen ? "OPEN" : "CLOSED");
-            ImGui::Text("Voice Detected: %s", report.voiceDetected ? "YES" : "NO");
-            
-            ImGui::Separator();
-            ImGui::Text("Recommendations:");
-            ImGui::TextWrapped("%s", report.recommendations.c_str());
-        }
-        ImGui::End();
-    }
-}
-
-// ============================================================================
-// ОСТАЛЬНЫЕ ФУНКЦИИ (из оригинального файла)
-// ============================================================================
 void SafeStopAllThreads() {
     std::lock_guard<std::mutex> lock(g_threadManagementMutex);
     // Убираем: g_applicationClosing = true; — этот флаг теперь только для полного выхода
@@ -669,6 +466,8 @@ bool CheckTargetReachable(const std::string& ip) {
 
 void StartGreetingListener() {
     AddDebugLog("Starting greeting listener on port " + std::to_string(GREETING_PORT));
+    // Инициализируем SecureChannel для greeting (GCM)
+    InitializeGreetingChannel();
     greetingSocket = socket(AF_INET, SOCK_DGRAM, 0);
     if (greetingSocket == INVALID_SOCKET) {
         AddDebugLog("ERROR: Failed to create greeting socket");
@@ -718,13 +517,10 @@ void StopGreetingListener() {
 void GreetingListener() {
     AddDebugLog("Secure greeting listener thread started");
     ULONGLONG currentTime = GetTickCount64();
-    sockaddr_in fromAddr;
-    int fromLen = sizeof(fromAddr);
-    InitializeSecureStreams();
+    ULONGLONG lastLogTime = 0;   // <-- ДОБАВИТЬ ЭТУ СТРОКУ
     const int secureBufferSize = 1024;
     std::vector<uint8_t> buffer(secureBufferSize);
     DWORD timeout = 500;
-    ULONGLONG lastLogTime = 0;
     setsockopt(greetingSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
     while (greetingSocket != INVALID_SOCKET) {
@@ -737,8 +533,28 @@ void GreetingListener() {
         if (bytesReceived > 0) {
             std::string fromIP = inet_ntoa(fromAddr.sin_addr);
             std::vector<uint8_t> packet(buffer.begin(), buffer.begin() + bytesReceived);
-            std::vector<uint8_t> greeting_data = secureGreetingStream->receive_secure(packet);
+
+            // Минимальная длина: nonce (12) + tag (16) = 28 байт
+            if (packet.size() < 12 + 16) {
+                AddDebugLog("Greeting packet too small, ignoring");
+                continue;
+            }
+
+            SecureChannel::EncryptedPacket encPkt;
+            encPkt.nonce.assign(packet.begin(), packet.begin() + 12);
+            encPkt.ciphertext.assign(packet.begin() + 12, packet.end() - 16);
+            encPkt.tag.assign(packet.end() - 16, packet.end());
+            encPkt.timestamp = 0;
+            encPkt.sequenceNumber = 0;
+
+            if (!g_greetingChannel) {
+                AddDebugLog("Greeting channel not initialized");
+                continue;
+            }
+
+            std::vector<uint8_t> greeting_data = g_greetingChannel->Decrypt(encPkt);
             AddDebugLog("Decrypted greeting size: " + std::to_string(greeting_data.size()));
+
             if (!greeting_data.empty() && greeting_data.size() == GREETING_LENGTH) {
                 AddDebugLog("Greeting content: " + std::string(greeting_data.begin(), greeting_data.end()));
             }
@@ -811,7 +627,7 @@ void GreetingSender() {
     }
     if (attempt >= maxAttempts && !stopGreetingSender) {
         AddDebugLog("Greeting sender timeout - no response received");
-        connectionErrorMsg = "No response from target after 10 minutes";
+        connectionErrorMsg = "No response from target after 2 minutes";
         showConnectionError = true;
         connectionStatus = STATUS_WAITING_GREETING;
     }
@@ -820,6 +636,11 @@ void GreetingSender() {
 
 void SendGreeting(const std::string& targetIP) {
     if (greetingSocket == INVALID_SOCKET) return;
+    if (!g_greetingChannel) {
+        AddDebugLog("Greeting channel not initialized");
+        return;
+    }
+
     sockaddr_in destAddr;
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(GREETING_PORT);
@@ -828,19 +649,34 @@ void SendGreeting(const std::string& targetIP) {
         AddDebugLog("ERROR: Invalid target IP for greeting: " + targetIP);
         return;
     }
-    InitializeSecureStreams();
-    std::vector<uint8_t> greeting_data(reinterpret_cast<const uint8_t*>(GREETING_MESSAGE),
+
+    std::vector<uint8_t> plaintext(reinterpret_cast<const uint8_t*>(GREETING_MESSAGE),
         reinterpret_cast<const uint8_t*>(GREETING_MESSAGE) + GREETING_LENGTH);
-    sockaddr_in* original_addr = secureGreetingStream->get_target_addr();
-    sockaddr_in temp_addr = *original_addr;
-    secureGreetingStream->set_target_addr(&destAddr);
-    secureGreetingStream->send_secure(greeting_data);
-    secureGreetingStream->set_target_addr(&temp_addr);
+    auto encrypted = g_greetingChannel->Encrypt(plaintext);
+    if (encrypted.ciphertext.empty()) {
+        AddDebugLog("Encryption failed for greeting");
+        return;
+    }
+
+    // Формируем UDP-пакет: nonce (12) + ciphertext + tag (16)
+    std::vector<uint8_t> udpPacket;
+    udpPacket.reserve(encrypted.nonce.size() + encrypted.ciphertext.size() + encrypted.tag.size());
+    udpPacket.insert(udpPacket.end(), encrypted.nonce.begin(), encrypted.nonce.end());
+    udpPacket.insert(udpPacket.end(), encrypted.ciphertext.begin(), encrypted.ciphertext.end());
+    udpPacket.insert(udpPacket.end(), encrypted.tag.begin(), encrypted.tag.end());
+
+    sendto(greetingSocket, (const char*)udpPacket.data(), udpPacket.size(), 0,
+        (sockaddr*)&destAddr, sizeof(destAddr));
     AddDebugLog("Secure greeting sent to " + targetIP);
 }
 
 void SendGreetingResponse(const std::string& targetIP) {
     if (greetingSocket == INVALID_SOCKET) return;
+    if (!g_greetingChannel) {
+        AddDebugLog("Greeting channel not initialized");
+        return;
+    }
+
     sockaddr_in destAddr{};
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(GREETING_PORT);
@@ -849,14 +685,23 @@ void SendGreetingResponse(const std::string& targetIP) {
         AddDebugLog("ERROR: Invalid IP for greeting response");
         return;
     }
-    InitializeSecureStreams();
-    std::vector<uint8_t> response_data(reinterpret_cast<const uint8_t*>(GREETING_RESPONSE),
+
+    std::vector<uint8_t> plaintext(reinterpret_cast<const uint8_t*>(GREETING_RESPONSE),
         reinterpret_cast<const uint8_t*>(GREETING_RESPONSE) + GREETING_LENGTH);
-    sockaddr_in* original_addr = secureGreetingStream->get_target_addr();
-    sockaddr_in temp_addr = *original_addr;
-    secureGreetingStream->set_target_addr(&destAddr);
-    secureGreetingStream->send_secure(response_data);
-    secureGreetingStream->set_target_addr(&temp_addr);
+    auto encrypted = g_greetingChannel->Encrypt(plaintext);
+    if (encrypted.ciphertext.empty()) {
+        AddDebugLog("Encryption failed for greeting response");
+        return;
+    }
+
+    std::vector<uint8_t> udpPacket;
+    udpPacket.reserve(encrypted.nonce.size() + encrypted.ciphertext.size() + encrypted.tag.size());
+    udpPacket.insert(udpPacket.end(), encrypted.nonce.begin(), encrypted.nonce.end());
+    udpPacket.insert(udpPacket.end(), encrypted.ciphertext.begin(), encrypted.ciphertext.end());
+    udpPacket.insert(udpPacket.end(), encrypted.tag.begin(), encrypted.tag.end());
+
+    sendto(greetingSocket, (const char*)udpPacket.data(), udpPacket.size(), 0,
+        (sockaddr*)&destAddr, sizeof(destAddr));
     AddDebugLog("Secure greeting RESPONSE sent to " + targetIP);
 }
 
@@ -944,11 +789,15 @@ void CaptureAudio() {
 
     HWAVEIN hWaveIn = nullptr;
     HANDLE hBufferEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    waveInOpen(&hWaveIn, selectedMicrophoneId, &wfx, (DWORD_PTR)hBufferEvent, 0, CALLBACK_EVENT);
+    if (waveInOpen(&hWaveIn, selectedMicrophoneId, &wfx, (DWORD_PTR)hBufferEvent, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) {
+        AddDebugLog("ERROR: Failed to open microphone");
+        return;
+    }
 
     const int NUM_BUFFERS = 8;
+    const int SAMPLES_PER_FRAME = AUDIO_DATA_SIZE / sizeof(int16_t);
     WAVEHDR waveHeaders[NUM_BUFFERS];
-    std::vector<std::vector<int16_t>> buffers(NUM_BUFFERS, std::vector<int16_t>(AUDIO_DATA_SIZE / sizeof(int16_t)));
+    std::vector<std::vector<int16_t>> buffers(NUM_BUFFERS, std::vector<int16_t>(SAMPLES_PER_FRAME));
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
         waveHeaders[i] = {};
@@ -959,82 +808,67 @@ void CaptureAudio() {
     }
 
     waveInStart(hWaveIn);
-
-    // СОСТОЯНИЕ ДЛЯ УМНОЙ ОТПРАВКИ
     int bufferIndex = 0;
     int hangoverFrames = 0;
-    const int MAX_HANGOVER = 20; // Удержание канала открытым ~200мс после последнего слова
-    std::deque<std::vector<int16_t>> preBuffer; // Чтобы не "съедались" первые буквы
-
+    const int HANGOVER_FRAMES = 12;   // удержание после потери голоса
+    int test = 0;
     while (isRunning && !g_applicationClosing) {
         if (WaitForSingleObject(hBufferEvent, 50) != WAIT_OBJECT_0) continue;
-
+        
         WAVEHDR* currentHeader = &waveHeaders[bufferIndex];
         if (!(currentHeader->dwFlags & WHDR_DONE)) continue;
 
         if (!isMuted) {
             std::vector<int16_t> audioData(buffers[bufferIndex]);
-
-            // Обработка (VAD, Шумодав, AGC)
+            
+            // Обработка (шумоподавление, AGC, VAD)
             ProcessAudioCapture(audioData);
 
-            bool isVoice = false;
-            float confidence = 0.0f;
-            bool gateOpen = false;
-
+            bool voiceActive = false;
             if (g_audioProcessor) {
-                auto vd = g_audioProcessor->GetVoiceDetectorStats();
-                auto st = g_audioProcessor->GetAdvancedStats();
-                isVoice = vd.isVoice;
-                confidence = vd.confidence; // ТЕПЕРЬ ОПРЕДЕЛЕНО
-                gateOpen = st.noiseGateOpen;
+                voiceActive = g_audioProcessor->GetAdvancedStats().voiceActive;
             }
 
-            // ЛОГИКА АКТИВАЦИИ (VAD)
-            // Порог 0.45 отсекает трение микрофона, но ловит тихий голос
-            bool hasRealVoice = (isVoice && confidence > 0.45f);
-
-            if (hasRealVoice) {
-                hangoverFrames = MAX_HANGOVER;
+            if (voiceActive) {
+                hangoverFrames = HANGOVER_FRAMES;
             }
             else if (hangoverFrames > 0) {
                 hangoverFrames--;
             }
 
-            // ПРИНЯТИЕ РЕШЕНИЯ ОБ ОТПРАВКЕ ПАКЕТА
-            bool shouldSend = (hangoverFrames > 0);
+            if (hangoverFrames > 0) {
+                std::vector<uint8_t> encoded = g_audioCodec->Encode(audioData);
+                if (!encoded.empty()) {
+                    auto packets = g_reliableTransport->PreparePackets(encoded, ReliableTransport::PacketType::DATA);
+                    for (auto& pkt : packets) {
+                        auto serialized = pkt.Serialize();
+                        auto encryptedPacket = g_secureChannel->Encrypt(serialized);
+                        if (!encryptedPacket.ciphertext.empty()) {
+                            // Формируем UDP-датаграмму: nonce (12 байт) + ciphertext + tag (16 байт)
+                            std::vector<uint8_t> udpPacket;
+                            udpPacket.reserve(encryptedPacket.nonce.size() + encryptedPacket.ciphertext.size() + encryptedPacket.tag.size());
+                            udpPacket.insert(udpPacket.end(), encryptedPacket.nonce.begin(), encryptedPacket.nonce.end());
+                            udpPacket.insert(udpPacket.end(), encryptedPacket.ciphertext.begin(), encryptedPacket.ciphertext.end());
+                            udpPacket.insert(udpPacket.end(), encryptedPacket.tag.begin(), encryptedPacket.tag.end());
 
-            if (shouldSend) {
-                // Если это начало фразы - досылаем пре-буфер (первые буквы)
-                while (!preBuffer.empty()) {
-                    auto pb = preBuffer.front();
-                    if (secureAudioStream) {
-                        std::vector<uint8_t> data(pb.size() * sizeof(int16_t));
-                        memcpy(data.data(), pb.data(), data.size());
-                        secureAudioStream->send_secure(data);
+                            // Отправляем напрямую через udpSocket
+                            sendto(udpSocket, (const char*)udpPacket.data(), udpPacket.size(), 0,
+                                (sockaddr*)&targetAddr, sizeof(targetAddr));
+                        }
                     }
-                    preBuffer.pop_front();
-                }
-
-                if (secureAudioStream) {
-                    std::vector<uint8_t> data(audioData.size() * sizeof(int16_t));
-                    memcpy(data.data(), audioData.data(), data.size());
-                    secureAudioStream->send_secure(data);
                 }
             }
-            else {
-                // Голоса нет — пакеты не шлем, копим пре-буфер для следующей фразы
-                preBuffer.push_back(audioData);
-                if (preBuffer.size() > 3) preBuffer.pop_front();
-            }
+            // Если голоса нет, ничего не отправляем (экономия трафика)
         }
 
+        // Переиспользование буфера
         waveInUnprepareHeader(hWaveIn, currentHeader, sizeof(WAVEHDR));
         currentHeader->dwFlags = 0;
         waveInPrepareHeader(hWaveIn, currentHeader, sizeof(WAVEHDR));
         waveInAddBuffer(hWaveIn, currentHeader, sizeof(WAVEHDR));
         bufferIndex = (bufferIndex + 1) % NUM_BUFFERS;
     }
+
     waveInStop(hWaveIn);
     waveInReset(hWaveIn);
     for (int i = 0; i < NUM_BUFFERS; i++) {
@@ -1042,13 +876,13 @@ void CaptureAudio() {
     }
     waveInClose(hWaveIn);
     CloseHandle(hBufferEvent);
-
     AddDebugLog("Audio capture stopped");
 }
 
 void PlayAudio() {
-    AddDebugLog("Audio playback thread started");
+    AddDebugLog("Audio playback thread started with dynamic jitter buffer");
 
+    // Инициализация WaveOut
     WAVEFORMATEX wfx = {};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
     wfx.nChannels = NUM_CHANNELS;
@@ -1058,16 +892,14 @@ void PlayAudio() {
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
 
     HWAVEOUT hWaveOut = nullptr;
-    MMRESULT result = waveOutOpen(&hWaveOut, selectedHeadphonesId, &wfx, 0, 0, CALLBACK_NULL);
-    if (result != MMSYSERR_NOERROR) {
-        AddDebugLog("Failed to open headphones: " + std::to_string(result));
+    if (waveOutOpen(&hWaveOut, selectedHeadphonesId, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        AddDebugLog("ERROR: Failed to open headphones for playback");
         return;
     }
 
     const int NUM_BUFFERS = 6;
     WAVEHDR waveHeaders[NUM_BUFFERS];
-    std::vector<std::vector<int16_t>> buffers(NUM_BUFFERS,
-        std::vector<int16_t>(AUDIO_DATA_SIZE / sizeof(int16_t)));
+    std::vector<std::vector<int16_t>> buffers(NUM_BUFFERS, std::vector<int16_t>(AUDIO_DATA_SIZE / sizeof(int16_t)));
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
         waveHeaders[i] = {};
@@ -1076,120 +908,217 @@ void PlayAudio() {
         waveOutPrepareHeader(hWaveOut, &waveHeaders[i], sizeof(WAVEHDR));
     }
 
-    // === JITTER BUFFER ===
+    // Jitter buffer
     std::deque<std::vector<int16_t>> jitterBuffer;
-    const size_t TARGET_SIZE = 4;   // 200ms буфер
-    const size_t MAX_SIZE = 10;     // Максимум 500ms
+    const size_t MAX_BUFFER_FRAMES = 20;    // максимум 20 кадров (~1.2 сек)
+    const size_t MIN_BUFFER_FRAMES = 2;     // минимум 2 кадра (~120 мс)
+
+    // Статистика для адаптации
+    std::deque<double> interarrivalMs;      // межпакетные интервалы в мс
+    double avgDelay = 0.0, delayVar = 0.0;
+    auto lastPktTime = std::chrono::steady_clock::now();
+    bool firstPkt = true;
+    double targetFrames = 4.0;              // плавная цель (в кадрах)
+    double smoothTarget = 4.0;
+    const double ALPHA = 0.2;               // сглаживание цели
+    const double SAFETY_FACTOR = 2.0;       // target = avg + factor * stddev
+
+    // Состояние воспроизведения
     bool primed = false;
-
+    int consecutiveUnderflows = 0;
     int bufferIndex = 0;
-    int packetsReceived = 0;
-    int packetsPlayed = 0;
-    int underruns = 0;
-    auto lastStats = std::chrono::steady_clock::now();
+    uint64_t packetsReceived = 0, packetsLost = 0;
+    auto lastAdaptTime = std::chrono::steady_clock::now();
 
-    AddDebugLog("Playback with jitter buffer started");
-
+    // Основной цикл
     while (isRunning && !g_applicationClosing) {
-        // === ПРИЁМ: неблокирующий ===
+        // --- 1. Приём UDP-пакета ---
         sockaddr_in fromAddr;
         int fromLen = sizeof(fromAddr);
         std::vector<uint8_t> recvBuffer(MAX_PACKET_SIZE);
-
-        // Неблокирующий приём
         u_long nonBlock = 1;
         ioctlsocket(udpSocket, FIONBIO, &nonBlock);
-
-        int recvLen = recvfrom(udpSocket, reinterpret_cast<char*>(recvBuffer.data()),
-            recvBuffer.size(), 0, (sockaddr*)&fromAddr, &fromLen);
+        int recvLen = recvfrom(udpSocket, (char*)recvBuffer.data(), recvBuffer.size(), 0,
+                               (sockaddr*)&fromAddr, &fromLen);
 
         if (recvLen > 0) {
             packetsReceived++;
             std::vector<uint8_t> packet(recvBuffer.begin(), recvBuffer.begin() + recvLen);
-            std::vector<uint8_t> decrypted = secureAudioStream->receive_secure(packet);
 
-            if (!decrypted.empty() && decrypted.size() >= 64) {  // Минимум 32 сэмпла
-                std::vector<int16_t> audio(decrypted.size() / sizeof(int16_t));
-                memcpy(audio.data(), decrypted.data(), decrypted.size());
-
-                // Добавляем в jitter buffer
-                jitterBuffer.push_back(audio);
-
-                // Ограничиваем размер
-                while (jitterBuffer.size() > MAX_SIZE) {
-                    jitterBuffer.pop_front();
+            // Расшифровка
+            if (packet.size() < 12 + 16) continue;
+            SecureChannel::EncryptedPacket encPkt;
+            encPkt.nonce.assign(packet.begin(), packet.begin() + 12);
+            encPkt.ciphertext.assign(packet.begin() + 12, packet.end() - 16);
+            encPkt.tag.assign(packet.end() - 16, packet.end());
+            encPkt.timestamp = 0;
+            encPkt.sequenceNumber = 0;
+            std::vector<uint8_t> decrypted = g_secureChannel->Decrypt(encPkt);
+            if (!decrypted.empty()) {
+                auto netPkt = ReliableTransport::NetworkPacket::Deserialize(decrypted);
+                if (g_reliableTransport->VerifyChecksum(netPkt)) {
+                    g_reliableTransport->ProcessPacket(netPkt);
                 }
+            }
+
+            // Обновление статистики межпакетных интервалов
+            auto now = std::chrono::steady_clock::now();
+            if (!firstPkt) {
+                double dt = std::chrono::duration<double, std::milli>(now - lastPktTime).count();
+                interarrivalMs.push_back(dt);
+                if (interarrivalMs.size() > 100) interarrivalMs.pop_front();
+
+                // Вычисляем среднее и дисперсию
+                double sum = 0.0, sumSq = 0.0;
+                for (double t : interarrivalMs) {
+                    sum += t;
+                    sumSq += t * t;
+                }
+                avgDelay = sum / interarrivalMs.size();
+                delayVar = (sumSq / interarrivalMs.size()) - avgDelay * avgDelay;
+                if (delayVar < 0) delayVar = 0;
+                double stddev = sqrt(delayVar);
+
+                // Целевой размер буфера (в кадрах) на основе статистики
+                double frameDurationMs = (double)BUFFER_DURATION_MS;
+                double optimal = (avgDelay + SAFETY_FACTOR * stddev) / frameDurationMs;
+                targetFrames = std::clamp(optimal, (double)MIN_BUFFER_FRAMES, (double)MAX_BUFFER_FRAMES);
+                smoothTarget = ALPHA * targetFrames + (1.0 - ALPHA) * smoothTarget;
+            }
+            firstPkt = false;
+            lastPktTime = std::chrono::steady_clock::now();
+        }
+
+        // --- 2. Получение собранных данных от ReliableTransport ---
+        std::vector<uint8_t> completeData = g_reliableTransport->ReceiveCompleteData();
+        if (!completeData.empty()) {
+            std::vector<int16_t> pcm = g_audioCodec->Decode(completeData);
+            if (!pcm.empty()) {
+                jitterBuffer.push_back(std::move(pcm));
+                while (jitterBuffer.size() > MAX_BUFFER_FRAMES * 2)
+                    jitterBuffer.pop_front();
             }
         }
 
-        // === ВОСПРОИЗВЕДЕНИЕ ===
-        WAVEHDR* currentHeader = &waveHeaders[bufferIndex];
+        // --- 3. Адаптация по потерям (дополнительный механизм) ---
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastAdaptTime).count() >= 5) {
+            float lossRate = (packetsReceived > 0) ? (float)packetsLost / (packetsReceived + packetsLost) : 0.0f;
+            // Если потери высоки – увеличиваем buffer (осторожно, не более +2)
+            if (lossRate > 0.03f && smoothTarget < MAX_BUFFER_FRAMES - 2) {
+                smoothTarget += 0.5;
+            } else if (lossRate < 0.005f && smoothTarget > MIN_BUFFER_FRAMES + 1) {
+                smoothTarget -= 0.25;
+            }
+            smoothTarget = std::clamp(smoothTarget, (double)MIN_BUFFER_FRAMES, (double)MAX_BUFFER_FRAMES);
+            packetsReceived = packetsLost = 0;
+            lastAdaptTime = now;
+            AddDebugLog("Jitter: target=" + std::to_string(smoothTarget) + " frames, avgDelay=" + std::to_string(avgDelay) + " ms");
+        }
 
+        // --- 4. Воспроизведение ---
+        WAVEHDR* currentHeader = &waveHeaders[bufferIndex];
         if (!(currentHeader->dwFlags & WHDR_INQUEUE)) {
-            // Накопили достаточно?
-            if (!primed) {
-                if (jitterBuffer.size() >= TARGET_SIZE) {
-                    primed = true;
-                    AddDebugLog("Jitter buffer primed, size=" + std::to_string(jitterBuffer.size()));
-                }
+            // Если буфер ещё не наполнен до целевого размера – ждём
+            if (!primed && jitterBuffer.size() >= (size_t)smoothTarget) {
+                primed = true;
+                AddDebugLog("Jitter buffer primed: size="+ std::to_string(jitterBuffer.size()) +" % zu, target ="+std::to_string(smoothTarget));
             }
 
             if (primed && !jitterBuffer.empty()) {
-                // Воспроизводим
-                memcpy(buffers[bufferIndex].data(), jitterBuffer.front().data(),
-                    jitterBuffer.front().size() * sizeof(int16_t));
-                currentHeader->dwBufferLength = jitterBuffer.front().size() * sizeof(int16_t);
-
-                MMRESULT res = waveOutWrite(hWaveOut, currentHeader, sizeof(WAVEHDR));
-                if (res == MMSYSERR_NOERROR) {
-                    packetsPlayed++;
+                size_t samplesToCopy = jitterBuffer.front().size();
+                if (samplesToCopy * sizeof(int16_t) <= currentHeader->dwBufferLength) {
+                    memcpy(buffers[bufferIndex].data(), jitterBuffer.front().data(),
+                           samplesToCopy * sizeof(int16_t));
+                    currentHeader->dwBufferLength = (DWORD)(samplesToCopy * sizeof(int16_t));
+                } else {
+                    currentHeader->dwBufferLength = AUDIO_DATA_SIZE;
                 }
-
+                waveOutWrite(hWaveOut, currentHeader, sizeof(WAVEHDR));
                 jitterBuffer.pop_front();
                 bufferIndex = (bufferIndex + 1) % NUM_BUFFERS;
-            }
-            else {
-                // Нет данных — underrun
-                underruns++;
-                primed = false;  // Снова накапливаем
+                consecutiveUnderflows = 0;
+            } else {
+                // Нет данных – увеличиваем счётчик underflow, но не сбрасываем primed сразу
+                consecutiveUnderflows++;
+                if (consecutiveUnderflows > 10) {
+                    primed = false;
+                    consecutiveUnderflows = 0;
+                    AddDebugLog("Jitter buffer underflow – reset primed");
+                }
+                packetsLost++;
+                // Небольшая задержка для снижения нагрузки CPU
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         }
-
-        // === СТАТИСТИКА ===
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStats).count() >= 3) {
-            AddDebugLog(std::string("PLAYBACK: recv=") + std::to_string(packetsReceived) +
-                " play=" + std::to_string(packetsPlayed) +
-                " underr=" + std::to_string(underruns) +
-                " jitter=" + std::to_string(jitterBuffer.size()) +
-                "/" + std::to_string(TARGET_SIZE));
-            packetsReceived = 0;
-            packetsPlayed = 0;
-            underruns = 0;
-            lastStats = now;
-        }
-
-        Sleep(1);
     }
 
+    // Очистка
     waveOutReset(hWaveOut);
     for (int i = 0; i < NUM_BUFFERS; i++) {
         waveOutUnprepareHeader(hWaveOut, &waveHeaders[i], sizeof(WAVEHDR));
     }
     waveOutClose(hWaveOut);
-
-    AddDebugLog("Playback stopped");
+    AddDebugLog("Playback thread stopped");
 }
 
+//void NetworkSenderThread() {
+//    AddDebugLog("Network sender thread started");
+//    while (g_networkSenderRunning && !g_applicationClosing) {
+//        std::vector<std::vector<uint8_t>> packetsToSend;
+//
+//        // Получаем сериализованные пакеты из очереди отправки
+//        {
+//            std::unique_lock<std::mutex> lock(g_sendQueueMutex);
+//            if (g_sendQueueCV.wait_for(lock, std::chrono::milliseconds(20),
+//                [] { return !g_sendQueue.empty() || !g_networkSenderRunning; })) {
+//                while (!g_sendQueue.empty()) {
+//                    packetsToSend.push_back(std::move(g_sendQueue.front()));
+//                    g_sendQueue.pop();
+//                }
+//            }
+//        }
+//
+//        // Получаем пакеты для ретрансляции от ReliableTransport (тип NetworkPacket)
+//        auto retransPackets = g_reliableTransport->GetPacketsToSend();
+//        for (auto& pkt : retransPackets) {
+//            packetsToSend.push_back(pkt.Serialize());
+//        }
+//
+//        // Отправляем все пакеты через зашифрованный канал
+//        for (auto& rawPacket : packetsToSend) {
+//            if (secureAudioStream) {
+//                secureAudioStream->send_secure(rawPacket);
+//            }
+//        }
+//
+//        // Обновляем статистику для адаптивного битрейта (раз в секунду)
+//        static auto lastStatsUpdate = std::chrono::steady_clock::now();
+//        auto now = std::chrono::steady_clock::now();
+//        if (now - lastStatsUpdate > std::chrono::seconds(1)) {
+//            auto transportStats = g_reliableTransport->GetStatistics();
+//            AdaptiveBitrateController::NetworkMetrics metrics;
+//            metrics.packetLossRate = transportStats.packetLossRate;
+//            metrics.roundTripTime = transportStats.averageLatency;
+//            metrics.jitter = 0.0; // можно оценить из истории RTT
+//            metrics.bandwidth = 0;
+//            g_bitrateController->UpdateMetrics(metrics);
+//            int newBitrate = g_bitrateController->GetRecommendedBitrate();
+//            g_audioCodec->SetBitrate(newBitrate);
+//            lastStatsUpdate = now;
+//        }
+//    }
+//    AddDebugLog("Network sender thread stopped");
+//}
 // ============================================================================
 // ПОДКЛЮЧЕНИЕ
 // ============================================================================
-void StartConnection() {
-    AddDebugLog("Starting connection...");
-    g_applicationClosing = false;   // <-- ВАЖНО: снимаем флаг полного завершения
-    isRunning = true;
-    isConnected = false;
-    connectionStatus = STATUS_CONNECTING;
+    void StartConnection() {
+        AddDebugLog("Starting connection with reliable transport...");
+        g_applicationClosing = false;
+        isRunning = true;
+        isConnected = false;
+        connectionStatus = STATUS_CONNECTING;
 
     // Инициализация сокетов...
     udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1203,27 +1132,95 @@ void StartConnection() {
     targetAddr.sin_port = htons(PORT);
     targetAddr.sin_addr.s_addr = inet_addr(ipInput);
 
-    InitializeSecureStreams();
-    InitializeAudioProcessor();
+    SecureChannel::ChannelConfig channelConfig;
+    channelConfig.algorithm = SecureChannel::EncryptionAlgorithm::AES_256_GCM;
+    channelConfig.useAuthentication = true;
+    channelConfig.preSharedKey = "VoiceApp2024SecureLocalNetwork!!"; // ровно 32 символа
+    g_secureChannel = std::make_unique<SecureChannel>();
+    if (!g_secureChannel->Initialize(channelConfig)) {
+        AddDebugLog("ERROR: Failed to initialize SecureChannel");
+        return;
+    }
 
+    InitializeAudioProcessor();
+    // === Инициализация Audio Codec (Opus) ===
+    AdvancedAudioCodec::AudioConfig audioCfg;
+    audioCfg.targetBitrate = 32000;
+    audioCfg.complexity = 9;
+    audioCfg.enableFEC = true;
+    audioCfg.enableDTX = true;
+    audioCfg.enableCBR = false;
+    g_audioCodec = std::make_unique<AdvancedAudioCodec>();
+    if (!g_audioCodec->Initialize(audioCfg)) {
+        AddDebugLog("ERROR: Failed to initialize Opus codec");
+        return;
+    }
+
+    // === ReliableTransport ===
+    ReliableTransport::ReliabilityConfig relCfg;
+    relCfg.maxRetries = 3;
+    relCfg.retryTimeoutMs = 100;
+    relCfg.ackTimeoutMs = 50;
+    relCfg.packetSize = 1200;          // меньше MTU, оставляем место для шифрования
+    relCfg.enableFEC = true;
+    relCfg.fecRedundancy = 2;
+    g_reliableTransport = std::make_unique<ReliableTransport>();
+    if (!g_reliableTransport->Initialize(relCfg)) {
+        AddDebugLog("ERROR: Failed to initialize ReliableTransport");
+        return;
+    }
+
+    // === Adaptive Jitter Buffer ===
+    AdaptiveJitterBuffer::JitterConfig jitCfg;
+    jitCfg.minBufferMs = 30;
+    jitCfg.maxBufferMs = 200;
+    jitCfg.targetBufferMs = 60;
+    g_adaptiveJitterBuffer = std::make_unique<AdaptiveJitterBuffer>();
+    g_adaptiveJitterBuffer->Initialize(jitCfg);
+
+    // === Adaptive Bitrate Controller ===
+    AdaptiveBitrateController::BitrateConfig brCfg;
+    brCfg.minBitrate = 16000;
+    brCfg.maxBitrate = 64000;
+    brCfg.targetBitrate = 32000;
+    brCfg.startingBitrate = 32000;
+    brCfg.strategy = AdaptiveBitrateController::Strategy::BALANCED;
+    g_bitrateController = std::make_unique<AdaptiveBitrateController>();
+    g_bitrateController->Initialize(brCfg);
+
+    // Запуск потока сетевого отправителя
+    /*g_networkSenderRunning = true;
+    g_networkSenderThread = std::thread(NetworkSenderThread);*/
+
+    // Запуск потоков захвата и воспроизведения
     captureThread = std::thread(CaptureAudio);
     playThread = std::thread(PlayAudio);
 
     connectionStatus = STATUS_CONNECTED;
     isConnected = true;
-    AddDebugLog("Connection started");
-}
+    AddDebugLog("Connection started with reliable transport, Opus, adaptive bitrate");
+    }
 
-void StopConnection() {
-    AddDebugLog("Stopping connection...");
-    isRunning = false;
-    isConnected = false;
-    connectionStatus = STATUS_DISCONNECTED;
-    SafeStopAllThreads();
-    ShutdownAudioProcessor();
-    CleanupSecureStreams();
-    AddDebugLog("Connection stopped");
-}
+    void StopConnection() {
+        AddDebugLog("Stopping connection and reliable transport...");
+        isRunning = false;
+        isConnected = false;
+        connectionStatus = STATUS_DISCONNECTED;
+
+        g_networkSenderRunning = false;
+        g_sendQueueCV.notify_all();
+        if (g_networkSenderThread.joinable()) g_networkSenderThread.join();
+
+        SafeStopAllThreads();
+        ShutdownAudioProcessor();
+
+        g_reliableTransport.reset();
+        g_adaptiveJitterBuffer.reset();
+        g_bitrateController.reset();
+        g_audioCodec.reset();
+        g_secureChannel.reset();
+        AddDebugLog("Connection stopped");
+    }
 
 // ============================================================================
 // UI РЕНДЕРИНГ (ПОЛНЫЙ)
@@ -1289,9 +1286,35 @@ void RenderUI() {
         ImGui::Text("Input: %.1f dB | Output: %.1f dB | Gain: %.1f dB", stats.inputLevel, stats.outputLevel, stats.currentGain);
         ImGui::Text("Noise Gate: %s | Voice: %s", stats.noiseGateOpen ? "OPEN" : "CLOSED", stats.voiceDetected ? "YES" : "NO");
     }
-    
+    //ImGui::Separator();
+    //if (g_audioProcessor) {
+    //    auto& cfg = g_audioProcessor->advConfig;
+    //    auto& stats = g_audioProcessor->advStats;
+    //    auto test = g_audioProcessor->GetVoiceDetectorStats();
+    //    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.4f, 1.0f), "ДИНАМИЧЕСКАЯ СИСТЕМА (всё подстраивается само)");
+    //    ImGui::Separator();
+
+    //    // Слайдеры
+    //    ImGui::SliderFloat("Base Noise Gate (dB)", &cfg.noiseGateThreshold, -55.0f, -25.0f, "%.1f");
+    //    ImGui::SliderFloat("Base VAD Confidence", &cfg.vadThreshold, 0.20f, 0.55f, "%.2f");
+    //    ImGui::SliderFloat("Base AGC Target (dB)", &cfg.agcTargetLevel, -30.0f, -10.0f, "%.1f");
+    //    ImGui::SliderFloat("Noise Suppression", &cfg.nsReductionAmount, 0.3f, 1.0f, "%.2f");
+
+    //    ImGui::Separator();
+    //    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "ТЕКУЩИЕ ДИНАМИЧЕСКИЕ ЗНАЧЕНИЯ:");
+
+    //    ImGui::Text("Noise Gate: %.1f dB", cfg.dynamicNoiseGateThreshold);
+    //    ImGui::Text("VAD Confidence: %.2f", cfg.dynamicVADConfidence);
+    //    ImGui::Text("AGC Target: %.1f dB", cfg.dynamicAGCTargetLevel);
+    //    ImGui::Text("Voice Active: %s", stats.voiceActive ? "ДА (отправка)" : "НЕТ");
+    //    ImGui::Text("Voice Confidence: %.2f", stats.voiceConfidence);
+    //    ImGui::Text("Voice Confidence: %.2f", test.confidence);
+    //    ImGui::Text("Noise Gate Open: %s", stats.noiseGateOpen ? "ОТКРЫТ" : "ЗАКРЫТ");
+    //}
+    //else {
+    //    ImGui::Text("Audio processor not initialized yet");
+    //}
     ImGui::Separator();
-    
     // Device selection
     ImGui::Text("Audio Devices");
     ImGui::Separator();
@@ -1317,10 +1340,6 @@ void RenderUI() {
     }
     
     ImGui::End();
-    
-    // Render panels
-    RenderAudioSettingsPanel();
-    RenderQualityPanel();
     
     // Device selection dialogs
     if (showMicrophoneSelection) {
@@ -1360,14 +1379,33 @@ void RenderUI() {
         }
     }
     
-    // Debug log window
+    // Debug Log – с явной позицией и флагом, чтобы не прятался
     if (showDebugLog) {
-        ImGui::Begin("Debug Log", &showDebugLog);
-        std::lock_guard<std::mutex> lock(debugLogMutex);
-        for (const auto& msg : debugLog) {
-            ImGui::TextUnformatted(msg.c_str());
+        static bool firstFrame = true;
+        if (firstFrame) {
+            ImGui::SetNextWindowPos(ImVec2(100, 100), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
+            firstFrame = false;
         }
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+        ImGui::Begin("Debug Log", &showDebugLog, ImGuiWindowFlags_NoFocusOnAppearing);
+        if (ImGui::Button("Copy to Clipboard")) {
+            std::string fullLog;
+            {
+                std::lock_guard<std::mutex> lock(debugLogMutex);
+                for (const auto& line : debugLog) fullLog += line + "\n";
+            }
+            ImGui::SetClipboardText(fullLog.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::Text("Lines: %zu", debugLog.size());
+        ImGui::Separator();
+        ImGui::BeginChild("LogScrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+        {
+            std::lock_guard<std::mutex> lock(debugLogMutex);
+            for (const auto& line : debugLog) ImGui::TextUnformatted(line.c_str());
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
         ImGui::End();
     }
 }

@@ -27,8 +27,8 @@ public:
     struct BitrateConfig {
         int minBitrate = 16000;      // 16 kbps minimum
         int maxBitrate = 128000;     // 128 kbps maximum
-        int targetBitrate = 64000;   // 64 kbps target
-        int startingBitrate = 64000; // Starting point
+        int targetBitrate = 32000;   // 64 kbps target
+        int startingBitrate = 32000; // Starting point
         Strategy strategy = Strategy::BALANCED;
         
         // REMB (Receiver Estimated Maximum Bitrate) parameters

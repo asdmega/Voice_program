@@ -14,15 +14,17 @@
 #include <string>
 #include <vector>
 #include <winsock2.h>
+#include "audio_defs.h"
+
 
 // Unified voice application framework with all optimizations
 class VoiceApplicationFramework {
 public:
     struct FrameworkConfig {
         // Audio
-        int audioSampleRate = 48000;
-        int audioChannels = 1;
-        int audioFrameSizeMs = 10;
+        int audioSAMPLE_RATE = SAMPLE_RATE;
+        int audioChannels = NUM_CHANNELS;
+        int audioFrameSizeMs = BUFFER_DURATION_MS;
         int audioTargetBitrate = 32000;
 
         // Encryption

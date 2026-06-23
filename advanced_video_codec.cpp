@@ -956,7 +956,6 @@ void AdvancedVideoStreamManager::StreamLoop() {
                     uint16_t originalHeight;
                     uint16_t encodedWidth;
                     uint16_t encodedHeight;
-                    uint32_t frameSize;
                     uint8_t isKeyFrame;
                     uint8_t qualityLevel;
                     float scalingFactor;
@@ -969,7 +968,6 @@ void AdvancedVideoStreamManager::StreamLoop() {
                 header.originalHeight = static_cast<uint16_t>(encodedFrame.originalHeight);
                 header.encodedWidth = static_cast<uint16_t>(encodedFrame.width);
                 header.encodedHeight = static_cast<uint16_t>(encodedFrame.height);
-                header.frameSize = static_cast<uint32_t>(encodedFrame.data.size());
                 header.isKeyFrame = encodedFrame.isKeyFrame ? 1 : 0;
                 header.qualityLevel = encodedFrame.qualityLevel;
                 header.scalingFactor = encodedFrame.scalingFactor;

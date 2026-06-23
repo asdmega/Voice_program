@@ -141,38 +141,31 @@ ReliableTransport::NetworkPacket ReliableTransport::GenerateFECPacket(
     fecPacket.type = PacketType::FEC;
     fecPacket.sequenceNumber = sequenceNumberCounter++;
     fecPacket.groupNumber = groupNumber;
-    fecPacket.packetIndex = 255;  // Mark as FEC packet
+    fecPacket.packetIndex = 255;
     fecPacket.timestamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    fecPacket.priority = 0;  // Lower priority for FEC packets
+    fecPacket.priority = 0;
 
-    // XOR all packet payloads for redundancy
-    std::vector<uint8_t> fecData;
+    // Определяем максимальный размер полезной нагрузки среди пакетов группы
     size_t maxPayloadSize = 0;
+    for (const auto& packet : groupPackets) {
+        maxPayloadSize = std::max(maxPayloadSize, packet.payload.size());
+    }
+
+    // Создаём буфер для XOR, заполненный нулями
+    std::vector<uint8_t> fecData(maxPayloadSize, 0);
 
     for (const auto& packet : groupPackets) {
-        if (packet.payload.size() > maxPayloadSize) {
-            maxPayloadSize = packet.payload.size();
+        // Для каждого пакета копируем его payload в локальный буфер, дополняя нулями до maxPayloadSize
+        std::vector<uint8_t> paddedPayload = packet.payload;
+        paddedPayload.resize(maxPayloadSize, 0);
+        // XOR
+        for (size_t i = 0; i < maxPayloadSize; i++) {
+            fecData[i] ^= paddedPayload[i];
         }
     }
 
-    fecData.resize(maxPayloadSize + NetworkPacket::HEADER_SIZE);
-
-    for (const auto& packet : groupPackets) {
-        // Serialize packet header + payload
-        std::vector<uint8_t> packetData;
-        packetData.push_back(static_cast<uint8_t>(packet.type));
-
-        // XOR with FEC data
-        for (size_t i = 0; i < packet.payload.size(); i++) {
-            if (i < fecData.size()) {
-                fecData[i] ^= packet.payload[i];
-            }
-        }
-    }
-
-    fecPacket.payload = fecData;
+    fecPacket.payload = std::move(fecData);
     fecPacket.checksum = CalculateChecksum(fecPacket);
-
     return fecPacket;
 }
 
@@ -308,4 +301,53 @@ void ReliableTransport::DetectPacketLoss() {
 ReliableTransport::TransportStatistics ReliableTransport::GetStatistics() const {
     std::lock_guard<std::mutex> lock(statsMutex);
     return statistics;
+}
+// reliable_transport.cpp
+
+std::vector<uint8_t> ReliableTransport::NetworkPacket::Serialize() const {
+    std::vector<uint8_t> result;
+    result.reserve(HEADER_SIZE + payload.size());
+
+    auto append = [&result](const void* data, size_t size) {
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+        result.insert(result.end(), bytes, bytes + size);
+        };
+
+    append(&type, sizeof(type));
+    append(&sequenceNumber, sizeof(sequenceNumber));
+    append(&groupNumber, sizeof(groupNumber));
+    append(&packetIndex, sizeof(packetIndex));
+    append(&timestamp, sizeof(timestamp));
+    append(&checksum, sizeof(checksum));
+    append(&priority, sizeof(priority));
+    result.insert(result.end(), payload.begin(), payload.end());
+
+    return result;
+}
+
+ReliableTransport::NetworkPacket ReliableTransport::NetworkPacket::Deserialize(const std::vector<uint8_t>& data) {
+    NetworkPacket pkt;
+    if (data.size() < HEADER_SIZE) return pkt;
+
+    size_t offset = 0;
+    auto read = [&data, &offset](void* dest, size_t size) -> bool {
+        if (offset + size > data.size()) return false;
+        memcpy(dest, data.data() + offset, size);
+        offset += size;
+        return true;
+        };
+
+    if (!read(&pkt.type, sizeof(pkt.type))) return pkt;
+    if (!read(&pkt.sequenceNumber, sizeof(pkt.sequenceNumber))) return pkt;
+    if (!read(&pkt.groupNumber, sizeof(pkt.groupNumber))) return pkt;
+    if (!read(&pkt.packetIndex, sizeof(pkt.packetIndex))) return pkt;
+    if (!read(&pkt.timestamp, sizeof(pkt.timestamp))) return pkt;
+    if (!read(&pkt.checksum, sizeof(pkt.checksum))) return pkt;
+    if (!read(&pkt.priority, sizeof(pkt.priority))) return pkt;
+
+    if (offset < data.size()) {
+        pkt.payload.assign(data.begin() + offset, data.end());
+    }
+
+    return pkt;
 }

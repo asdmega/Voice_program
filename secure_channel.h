@@ -64,15 +64,31 @@ public:
     };
 
     SecurityStatus GetStatus() const;
+    bool StartDHKeyExchange();
+    // Получение публичного ключа для отправки
+    std::vector<uint8_t> GetPublicKey() const;
+    // Установка публичного ключа партнёра
+    bool SetPeerPublicKey(const std::vector<uint8_t>& peerPub);
+    // После согласования ключа вызываем для инициализации шифрования
+    bool FinalizeKeyExchange();
 
 private:
+    DH* dh = nullptr;
+    BIGNUM* privKey = nullptr;
+    BIGNUM* pubKey = nullptr;
+    BIGNUM* peerPubKey = nullptr;
+    std::vector<uint8_t> sharedSecret;
+    EVP_CIPHER_CTX* encryptCtx = nullptr;
+    EVP_CIPHER_CTX* decryptCtx = nullptr;
+    // для хранения ключа и алгоритма
+    const EVP_CIPHER* cipher = nullptr;
     ChannelConfig config;
     EVP_CIPHER_CTX* encryptContext = nullptr;
     EVP_CIPHER_CTX* decryptContext = nullptr;
 
     // Encryption keys
     std::array<uint8_t, 32> encryptionKey;      // 256-bit key
-    std::array<uint8_t, 32> authenticationKey;  // For HMAC
+ 
     
     // Nonce management (prevents replay attacks)
     uint64_t nonceCounter = 0;

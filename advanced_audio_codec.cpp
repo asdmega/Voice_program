@@ -28,8 +28,8 @@ bool AdvancedAudioCodec::Initialize(const AudioConfig& cfg) {
     
     // Create encoder
     encoder = opus_encoder_create(
-        config.sampleRate,
-        config.channels,
+        SAMPLE_RATE,
+        NUM_CHANNELS,
         OPUS_APPLICATION_VOIP,  // Optimized for voice
         &error
     );
@@ -41,8 +41,8 @@ bool AdvancedAudioCodec::Initialize(const AudioConfig& cfg) {
 
     // Create decoder
     decoder = opus_decoder_create(
-        config.sampleRate,
-        config.channels,
+        SAMPLE_RATE,
+        NUM_CHANNELS,
         &error
     );
     
@@ -90,7 +90,7 @@ std::vector<uint8_t> AdvancedAudioCodec::Encode(const std::vector<int16_t>& pcmD
     int encodedSize = opus_encode(
         encoder,
         pcmData.data(),
-        static_cast<int>(pcmData.size() / config.channels),
+        static_cast<int>(pcmData.size() / NUM_CHANNELS),
         encoded.data(),
         static_cast<int>(encoded.size())
     );
@@ -113,20 +113,21 @@ std::vector<uint8_t> AdvancedAudioCodec::Encode(const std::vector<int16_t>& pcmD
             statistics.averageCompressionRatio = 
                 static_cast<double>(statistics.bytesIn) / statistics.bytesOut;
             statistics.averageBitrate = 
-                (statistics.bytesOut * 8.0 * config.sampleRate) / 
-                (config.frameSize * statistics.packetsEncoded);
+                (statistics.bytesOut * 8.0 * SAMPLE_RATE) / 
+                (frameSize * statistics.packetsEncoded);
         }
+
     }
 
     return encoded;
 }
 
-std::vector<int16_t> AdvancedAudioCodec::Decode(const std::vector<uint8_t>& opusData, int frameSize) {
+std::vector<int16_t> AdvancedAudioCodec::Decode(const std::vector<uint8_t>& opusData) {
     if (!decoder || opusData.empty()) {
         return std::vector<int16_t>();
     }
 
-    std::vector<int16_t> decoded(frameSize * config.channels);
+    std::vector<int16_t> decoded(frameSize * NUM_CHANNELS);
     
     int decodedSize = opus_decode(
         decoder,
@@ -142,7 +143,7 @@ std::vector<int16_t> AdvancedAudioCodec::Decode(const std::vector<uint8_t>& opus
         return std::vector<int16_t>();
     }
 
-    decoded.resize(decodedSize * config.channels);
+    decoded.resize(decodedSize * NUM_CHANNELS);
 
     // Update statistics
     {

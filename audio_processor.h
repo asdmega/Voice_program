@@ -9,6 +9,7 @@
 #include <deque>
 #include <mutex>
 
+#include "audio_defs.h"
 
 // Professional Audio Processor for Voice Communication
 // Solves: crackling, quiet voice, background noise, distortion
@@ -17,10 +18,6 @@
 class AudioProcessor {
 public:
     struct ProcessorConfig {
-        int sampleRate = 48000;
-        int channels = 1;
-        int frameSize = 480;  // 10ms at 48kHz
-        
         // Noise Gate (for quiet voice)
         bool enableNoiseGate = true;
         float noiseGateThreshold = -45.0f;  // dB
@@ -55,9 +52,9 @@ public:
         float limiterThreshold = -3.0f;     // dB
         float limiterRelease = 10.0f;       // ms
         
-        // High-pass filter (remove low rumble)
+        // High-pass filter (remove low rumble and electrical noise)
         bool enableHighPass = true;
-        float highPassFreq = 80.0f;         // Hz
+        float highPassFreq = 280.0f;        // Hz - raised from 80 to cut 50/60Hz mains noise
         
         // Low-pass filter (remove high frequency noise)
         bool enableLowPass = false;
@@ -99,11 +96,6 @@ public:
     // Reset all processors
     void Reset();
 
-    // Utility functions
-    static float DbToLinear(float db);
-    static float LinearToDb(float linear);
-    static void FloatToInt16(const float* input, int16_t* output, int samples);
-    static void Int16ToFloat(const int16_t* input, float* output, int samples);
 
 protected:
     ProcessorConfig config;
@@ -130,7 +122,8 @@ protected:
         int holdCount = 0;
         bool isOpen = false;
         float noiseEstimate = 0.0f;
-        uint8_t consecutiveOpenFrames = 0;  // НОВОЕ: для минимальной длительности
+        uint8_t consecutiveOpenFrames = 0;  // пїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
+        int impulseCounter = 0;  // Counter for impulse noise detection (keyboard clicks)
     };
     NoiseGateState ngState[2];
 
@@ -168,7 +161,7 @@ protected:
     LimiterState limiterState[2];
 
     // FFT-related for noise suppression
-    static constexpr int FFT_SIZE = 512;
+    static constexpr int FFT_SIZE = 2048;
     static constexpr int OVERLAP = 2;
     std::vector<float> fftWindow;
     std::vector<float> fftBuffer[2];
@@ -182,14 +175,7 @@ protected:
     void CalculateHighPassCoeffs();
     void CalculateLowPassCoeffs();
     void ProcessBiquad(float* audioData, int samples, const float* coeffs, BiquadState* state, int stride = 1);
-    void ProcessFFTNoiseSuppression(float* audioData, int channel);
     void SimpleNoiseSuppression(float* audioData, int samples, int channel);
     void UpdateNoiseEstimate(const float* audioData, int samples, int channel);
-    float CalculateRMS(const float* audioData, int samples);
-    float CalculatePeak(const float* audioData, int samples);
     
-    // Optimized FFT for noise suppression
-    void FFT(std::vector<float>& real, std::vector<float>& imag, bool inverse);
-    void ApplySpectralGating(float* magnitude, int size, int channel);
-
 };

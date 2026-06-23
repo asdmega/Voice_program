@@ -5,12 +5,13 @@
 #include <numeric>
 #include "voice_detector.h"
 #include <iostream>
-
-static const float PI = 3.14159265358979323846f;
-static const float TWO_PI = 2.0f * PI;
+#include <array>
+#include "utility.h"
 
 AdvancedAudioProcessor::AdvancedAudioProcessor() {
     voiceDetector_ = std::make_unique<VoiceDetector>();  // уже есть
+    noiseSuppressor_ = std::make_unique<AdaptiveNoiseSuppression>();
+    distanceAnalyzer_ = std::make_unique<DistanceAnalyzer>();
 }
 
 AdvancedAudioProcessor::~AdvancedAudioProcessor() {
@@ -34,19 +35,31 @@ bool AdvancedAudioProcessor::InitializeAdvanced(const AdvancedConfig& config) {
 
     // === ИСПРАВЛЕНИЕ: ИНИЦИАЛИЗАЦИЯ VoiceDetector ===
     VoiceDetector::DetectorConfig vadConfig;
-    vadConfig.sampleRate = advConfig.sampleRate;
-    vadConfig.channels = advConfig.channels;
-    vadConfig.frameSize = advConfig.frameSize;
-    vadConfig.fftSize = 2048;          // как в твоём коде
-    vadConfig.hopSize = 960;           // должно совпадать с frameSize
     vadConfig.voiceHangoverMs = 400.0f;       // твои настройки
-    vadConfig.minVoiceConfidence = 0.4f; // ,skj 0.35f; // чуть выше, чтобы не было слишком много ложных срабатываний
+    vadConfig.minVoiceConfidence = 0.5f; // ,skj 0.35f; // чуть выше, чтобы не было слишком много ложных срабатываний
 
     if (!voiceDetector_->Initialize(vadConfig)) {
         std::cerr << "VoiceDetector initialization failed!" << std::endl;
         return false;
     }
+    if (noiseSuppressor_) {
+        noiseSuppressor_->SetVoiceDetector(voiceDetector_.get());  // .get() возвращает raw pointer
+    }
     // ================================================
+
+    // Initialize Adaptive Noise Suppression
+    if (noiseSuppressor_) {
+        AdaptiveNoiseSuppression::Config nsConfig;
+        nsConfig.minGainFloor = 0.85f;      // агрессивнее подавляет
+        noiseSuppressor_->Initialize(nsConfig);
+    }
+
+    // Initialize Distance Analyzer
+    if (distanceAnalyzer_) {
+        DistanceAnalyzer::Config daConfig;
+        daConfig.updateIntervalMs = 100;
+        distanceAnalyzer_->Initialize(daConfig);
+    }
 
     // Initialize spectral processing
     InitializeSpectralProcessing();
@@ -64,11 +77,23 @@ bool AdvancedAudioProcessor::InitializeAdvanced(const AdvancedConfig& config) {
 }
 
 void AdvancedAudioProcessor::InitializeSpectralProcessing() {
-    // Create Hann window
+    prevSpectralGain.assign(SPECTRAL_FFT_SIZE / 2 + 1, 1.0f);
+    prevGain.assign(SPECTRAL_FFT_SIZE / 2 + 1, 1.0f);   
     spectralWindow.resize(SPECTRAL_FFT_SIZE);
-    for (int i = 0; i < SPECTRAL_FFT_SIZE; i++) {
-        spectralWindow[i] = 0.5f - 0.5f * cosf(TWO_PI * i / (SPECTRAL_FFT_SIZE - 1));
+
+    for (int i = 0; i < fftSize; i++) {
+        spectralWindow[i] = 0.5f - 0.5f * cosf(TWO_PI * i / (fftSize - 1));
     }
+
+    float sum_overlap = 0.0f;
+    for (int i = 0; i < SPECTRAL_HOP_SIZE; i++) {
+        for (int frame = 0; frame * SPECTRAL_HOP_SIZE < SPECTRAL_FFT_SIZE; frame++) {
+            int idx = i + frame * SPECTRAL_HOP_SIZE;
+            if (idx < SPECTRAL_FFT_SIZE) sum_overlap += spectralWindow[idx];
+        }
+    }
+    float norm = SPECTRAL_FFT_SIZE / SPECTRAL_HOP_SIZE / sum_overlap;
+    for (float& w : spectralWindow) w *= norm;
     
     // Initialize buffers
     fftBuffer.resize(SPECTRAL_FFT_SIZE);
@@ -132,8 +157,8 @@ AdvancedAudioProcessor::VoiceDetectorStats AdvancedAudioProcessor::GetVoiceDetec
 }
 
 void AdvancedAudioProcessor::CalculateBandpassCoeffs(float* coeffs, float freq, float bandwidth, bool isHighpass) {
-    float fc = freq / advConfig.sampleRate;
-    float bw = bandwidth / advConfig.sampleRate;
+    float fc = freq / SAMPLE_RATE;
+    float bw = bandwidth / SAMPLE_RATE;
     float Q = freq / bandwidth;
     
     float w0 = TWO_PI * fc;
@@ -170,7 +195,7 @@ void AdvancedAudioProcessor::InitializeDynamicEQ() {
 
 void AdvancedAudioProcessor::CalculatePeakingEQCoeffs(float* coeffs, float freq, float q, float gainDb) {
     float A = powf(10.0f, gainDb / 40.0f);
-    float w0 = TWO_PI * freq / advConfig.sampleRate;
+    float w0 = TWO_PI * freq / SAMPLE_RATE;
     float cosw0 = cosf(w0);
     float sinw0 = sinf(w0);
     float alpha = sinw0 / (2.0f * q);
@@ -187,16 +212,16 @@ void AdvancedAudioProcessor::CalculatePeakingEQCoeffs(float* coeffs, float freq,
 
 // В advanced_audio_processor.cpp, в методе ProcessFrameAdvanced:
 bool AdvancedAudioProcessor::ApplyNoiseGateAndReturnState(float* audioData, int samples) {
-    float baseThreshold = DbToLinear(advConfig.noiseGateThreshold);  // сейчас будет -38
-    float attackCoeff = 1.0f - expf(-3000.0f / (advConfig.noiseGateAttack * advConfig.sampleRate));   // быстрее атака
-    float releaseCoeff = 1.0f - expf(-800.0f / (advConfig.noiseGateRelease * advConfig.sampleRate));
+    float baseThreshold = AudioUtils::DbToLinear(advConfig.noiseGateThreshold);  // сейчас будет -38
+    float attackCoeff = 1.0f - expf(-3000.0f / (advConfig.noiseGateAttack * SAMPLE_RATE));   // быстрее атака
+    float releaseCoeff = 1.0f - expf(-800.0f / (advConfig.noiseGateRelease * SAMPLE_RATE));
 
     bool anyGateOpen = false;
 
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         auto* state = &ngState[ch];
 
-        for (int i = ch; i < samples; i += advConfig.channels) {
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             float absVal = fabsf(audioData[i]);
 
             if (absVal > state->envelope)
@@ -222,7 +247,7 @@ void AdvancedAudioProcessor::AdaptAllParametersAutomatically(const VoiceDetector
     auto now = std::chrono::steady_clock::now().time_since_epoch().count() / 1'000'000;
 
     // Динамический порог Noise Gate
-    dynamicNoiseGateThreshold = -38.0f - (currentRMS < DbToLinear(-45.0f) ? 8.0f : 0.0f);
+    dynamicNoiseGateThreshold = -38.0f - (currentRMS < AudioUtils::DbToLinear(-45.0f) ? 8.0f : 0.0f);
 
     // Динамический VAD confidence
     dynamicVADConfidence = 0.28f;
@@ -230,58 +255,75 @@ void AdvancedAudioProcessor::AdaptAllParametersAutomatically(const VoiceDetector
     if (now - lastVoiceTime > 800)     dynamicVADConfidence -= 0.04f;     // долго нет голоса
 
     // Динамический AGC target
-    dynamicAGCTargetLevel = (currentRMS < DbToLinear(-42.0f)) ? -12.0f : -20.0f;
+    dynamicAGCTargetLevel = (currentRMS < AudioUtils::DbToLinear(-42.0f)) ? -12.0f : -20.0f;
 
     // Динамический уровень шумоподавления
     advConfig.nsReductionAmount = 0.75f + (detection.noiseFloor > -35.0f ? 0.15f : 0.0f);
 
     // Динамические de-esser пороги
-    advConfig.deesserThresholdLow = -19.0f - (currentRMS > DbToLinear(-22.0f) ? 4.0f : 0.0f);
+    advConfig.deesserThresholdLow = -19.0f - (currentRMS > AudioUtils::DbToLinear(-22.0f) ? 4.0f : 0.0f);
     advConfig.deesserThresholdMid = -23.0f;
     advConfig.deesserThresholdHigh = -27.0f;
 
     if (detection.isVoice) lastVoiceTime = now;
 }
-
+void AdvancedAudioProcessor::ApplyImpulseSuppressor(float* data, int samples) {
+    for (int i = 0; i < samples; i++) {
+        float absVal = fabsf(data[i]);
+        if (absVal > AudioUtils::DbToLinear(-12.0f)) {  // очень громкий импульс
+            data[i] *= 0.35f; // сильно приглушаем
+        }
+    }
+}
 void AdvancedAudioProcessor::ProcessFrameAdvanced(float* audioData, int samples) {
     if (!audioData || samples <= 0 || !voiceDetector_) return;
-    
-    // 1. Noise Gate (открывается на любой звук)
-    bool gateOpen = ApplyNoiseGateAndReturnState(audioData, samples);
+    if (advConfig.enableDCRemoval)      ApplyDCRemoval(audioData, samples);
+    if (advConfig.enableHighPass)       ApplyHighPassFilter(audioData, samples);
 
-    // 2. VoiceDetector
+    // 1. Детектор голоса на исходных данных
     std::vector<float> frameData(audioData, audioData + samples);
     auto detection = voiceDetector_->ProcessFrame(frameData);
 
-    // 3. Адаптация всех параметров в реальном времени
-    float currentRMS = CalculateRMS(audioData, samples);
+    // 2. Шумоподавление (один раз, с передачей уверенности)
+    if (advConfig.enableSpectralNS && noiseSuppressor_) {
+        noiseSuppressor_->SetVoiceConfidence(detection.confidence);
+        noiseSuppressor_->ProcessFrame(audioData, samples);
+    }
+
+    // 3. Вычисляем состояние noise gate (метод уже существует)
+    bool gateOpen = ApplyNoiseGateAndReturnState(audioData, samples);
+
+    // 4. Остальные анализы и адаптация
+    float currentRMS = AudioUtils::CalculateRMS(audioData, samples);
+    auto distanceProfile = distanceAnalyzer_->AnalyzeFrame(
+        audioData, samples, detection.confidence, detection.noiseFloor
+    );
     AdaptAllParametersAutomatically(detection, currentRMS, gateOpen);
 
-    // 4. ГЛАВНОЕ РЕШЕНИЕ ОТПРАВКИ (твоя логика)
-    bool voiceActive = gateOpen &&
-        detection.isVoice && 
+    // 5. Решение об отправке
+    bool voiceActive = detection.isVoice &&
         detection.confidence >= dynamicVADConfidence &&
         detection.voiceLevel > dynamicVoiceLevelThreshold;
 
-    // Обновляем статистику
+    // 6. Обновление статистики
     {
         std::lock_guard<std::mutex> lock(advStatsMutex);
         advStats.voiceDetected = detection.isVoice;
         advStats.voiceConfidence = detection.confidence;
-        advStats.noiseGateOpen = gateOpen;
         advStats.voiceActive = voiceActive;
+        advStats.noiseGateOpen = gateOpen;
     }
 
-    // 5. ЕСЛИ НЕ ГОЛОС — полностью глушим и ВЫХОДИМ (больше пакетов тишины!)
+    // 7. Если нет голоса – глушим и выходим
     if (!voiceActive) {
-        for (int i = 0; i < samples; i++) audioData[i] *= 0.085f; // почти тишина
+        for (int i = 0; i < samples; i++) audioData[i] *= 0.085f;
         return;
     }
 
-    // 6. Если голос — полный Discord-style процессинг
-    if (advConfig.enableDCRemoval)      ApplyDCRemoval(audioData, samples);
-    if (advConfig.enableHighPass)       ApplyHighPassFilter(audioData, samples);
-    //if (advConfig.enableSpectralNS)     ApplySpectralNoiseSuppression(audioData, samples);
+    // 8. Применяем остальные эффекты (только для активной речи)
+    if (detection.isImpulseNoise || detection.isPlosiveNoise) {
+        ApplyImpulseSuppressor(audioData, samples);
+    }
     if (advConfig.enableAGC)            ApplyAGC(audioData, samples);
     if (advConfig.enableMultibandDeesser) ApplyMultibandDeesser(audioData, samples);
     if (advConfig.enableLimiter)        ApplyLookaheadLimiter(audioData, samples);
@@ -291,27 +333,27 @@ void AdvancedAudioProcessor::ProcessFrameAdvanced(int16_t* audioData, int sample
     if (!audioData || samples <= 0) return;
     
     std::vector<float> floatData(samples);
-    Int16ToFloat(audioData, floatData.data(), samples);
+    AudioUtils::Int16ToFloat(audioData, floatData.data(), samples);
     
     ProcessFrameAdvanced(floatData.data(), samples);
     
-    FloatToInt16(floatData.data(), audioData, samples);
+    AudioUtils::FloatToInt16(floatData.data(), audioData, samples);
 }
 
 void AdvancedAudioProcessor::ApplySpectralNoiseSuppression(float* audioData, int samples) {
-    int hop = SPECTRAL_HOP_SIZE;
-    int frames = samples / advConfig.channels;
+    int hopSize = SPECTRAL_HOP_SIZE;
+    int frames = samples / NUM_CHANNELS;
 
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         std::vector<float> frame(SPECTRAL_FFT_SIZE, 0.0f);
 
         // Копируем с overlap
-        int overlapSize = SPECTRAL_FFT_SIZE - hop;
+        int overlapSize = SPECTRAL_FFT_SIZE - hopSize;
         for (int i = 0; i < overlapSize; i++) {
             frame[i] = overlapBuffer[ch][i];
         }
-        for (int i = 0; i < hop && i < frames; i++) {
-            frame[overlapSize + i] = audioData[ch + i * advConfig.channels];
+        for (int i = 0; i < hopSize && i < frames; i++) {
+            frame[overlapSize + i] = audioData[ch + i * NUM_CHANNELS];
         }
 
         // Окно
@@ -319,7 +361,7 @@ void AdvancedAudioProcessor::ApplySpectralNoiseSuppression(float* audioData, int
 
         // === FFT ===
         std::vector<std::complex<float>> freq(SPECTRAL_FFT_SIZE);
-        ComputeFFT(frame.data(), freq.data(), SPECTRAL_FFT_SIZE);
+        FFTUtils::ComputeFFT(frame.data(), freq.data(), SPECTRAL_FFT_SIZE);
 
         // Магнитуда
         std::vector<float> magnitude(SPECTRAL_FFT_SIZE / 2 + 1);
@@ -336,17 +378,17 @@ void AdvancedAudioProcessor::ApplySpectralNoiseSuppression(float* audioData, int
         }
 
         // === IFFT ===
-        ComputeIFFT(freq.data(), frame.data(), SPECTRAL_FFT_SIZE);
+        FFTUtils::ComputeIFFT(freq.data(), frame.data(), SPECTRAL_FFT_SIZE);
 
         // Копируем обратно
-        for (int i = 0; i < hop && i < frames; i++) {
-            int idx = ch + i * advConfig.channels;
+        for (int i = 0; i < hopSize && i < frames; i++) {
+            int idx = ch + i * NUM_CHANNELS;
             if (idx < samples) audioData[idx] = frame[i + overlapSize];
         }
 
         // Сохраняем overlap
         for (int i = 0; i < overlapSize; i++) {
-            overlapBuffer[ch][i] = frame[hop + i];
+            overlapBuffer[ch][i] = frame[hopSize + i];
         }
     }
 }
@@ -358,10 +400,10 @@ void AdvancedAudioProcessor::AdaptParametersAutomatically(float currentRMS, bool
 
     // === 1. Адаптация Noise Gate (при отдалении повышаем чувствительность) ===
     float targetNG = -38.0f;                    // базовый порог
-    if (currentRMS < DbToLinear(-42.0f)) {      // очень тихий голос (далеко)
+    if (currentRMS < AudioUtils::DbToLinear(-42.0f)) {      // очень тихий голос (далеко)
         targetNG = -48.0f;                      // делаем гейт более чувствительным
     }
-    else if (currentRMS > DbToLinear(-25.0f)) { // громкий голос (близко)
+    else if (currentRMS > AudioUtils::DbToLinear(-25.0f)) { // громкий голос (близко)
         targetNG = -32.0f;
     }
 
@@ -370,10 +412,10 @@ void AdvancedAudioProcessor::AdaptParametersAutomatically(float currentRMS, bool
 
     // === 2. Адаптация AGC Target Level ===
     float targetAGC = -20.0f;
-    if (currentRMS < DbToLinear(-40.0f)) {
+    if (currentRMS < AudioUtils::DbToLinear(-40.0f)) {
         targetAGC = -12.0f;                     // сильно усиливаем тихий голос
     }
-    else if (currentRMS > DbToLinear(-18.0f)) {
+    else if (currentRMS > AudioUtils::DbToLinear(-18.0f)) {
         targetAGC = -24.0f;                     // уменьшаем усиление при громкой речи
     }
 
@@ -381,7 +423,7 @@ void AdvancedAudioProcessor::AdaptParametersAutomatically(float currentRMS, bool
 
     // === 3. Адаптация VAD Threshold ===
     float targetVAD = -36.0f;
-    if (currentRMS < DbToLinear(-45.0f)) {
+    if (currentRMS < AudioUtils::DbToLinear(-45.0f)) {
         targetVAD = -48.0f;                     // ловим очень тихий голос на расстоянии
     }
     advConfig.vadThreshold = 0.88f * advConfig.vadThreshold + 0.12f * targetVAD;
@@ -397,16 +439,16 @@ void AdvancedAudioProcessor::ApplyMultibandDeesser(float* audioData, int samples
     float totalGainReduction = 0.0f;
     int reductionCount = 0;
     
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         // Process each band
-        std::vector<float> lowBand(samples / advConfig.channels);
-        std::vector<float> midBand(samples / advConfig.channels);
-        std::vector<float> highBand(samples / advConfig.channels);
+        std::vector<float> lowBand(samples / NUM_CHANNELS);
+        std::vector<float> midBand(samples / NUM_CHANNELS);
+        std::vector<float> highBand(samples / NUM_CHANNELS);
         
         // Extract bands
-        int frameSize = samples / advConfig.channels;
+        int frameSize = samples / NUM_CHANNELS;
         for (int i = 0; i < frameSize; i++) {
-            int idx = ch + i * advConfig.channels;
+            int idx = ch + i * NUM_CHANNELS;
             lowBand[i] = audioData[idx];
             midBand[i] = audioData[idx];
             highBand[i] = audioData[idx];
@@ -418,9 +460,9 @@ void AdvancedAudioProcessor::ApplyMultibandDeesser(float* audioData, int samples
         ProcessBiquad(highBand.data(), frameSize, deesserFilters.high, &deesserFilters.highState[ch]);
         
         // Calculate envelope and apply compression per band
-        float lowThresh = DbToLinear(advConfig.deesserThresholdLow);
-        float midThresh = DbToLinear(advConfig.deesserThresholdMid);
-        float highThresh = DbToLinear(advConfig.deesserThresholdHigh);
+        float lowThresh = AudioUtils::DbToLinear(advConfig.deesserThresholdLow);
+        float midThresh = AudioUtils::DbToLinear(advConfig.deesserThresholdMid);
+        float highThresh = AudioUtils::DbToLinear(advConfig.deesserThresholdHigh);
         
         float lowEnv = 0.0f, midEnv = 0.0f, highEnv = 0.0f;
         float attack = 0.1f, release = 0.01f;
@@ -468,12 +510,12 @@ void AdvancedAudioProcessor::ApplyMultibandDeesser(float* audioData, int samples
             
             // Track gain reduction
             if (combinedGain < 1.0f) {
-                totalGainReduction += LinearToDb(combinedGain);
+                totalGainReduction += AudioUtils::LinearToDb(combinedGain);
                 reductionCount++;
             }
             
             // Apply to original signal
-            int idx = ch + i * advConfig.channels;
+            int idx = ch + i * NUM_CHANNELS;
             audioData[idx] *= combinedGain;
         }
     }
@@ -490,43 +532,41 @@ void AdvancedAudioProcessor::ApplyMultibandDeesser(float* audioData, int samples
 
 // === НОВЫЙ: HIGH-FREQUENCY LIMITER — убивает хрип, не трогает голос ===
 void AdvancedAudioProcessor::ApplyHighFrequencyLimiter(float* audioData, int samples) {
-    const float hfThreshold = DbToLinear(-10.0f);   // только очень громкие высокие частоты
+    const float hfThreshold = AudioUtils::DbToLinear(-14.0f);
     const float attack = 0.03f;
     const float release = 0.015f;
 
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         float env = 0.0f;
-        for (int i = ch; i < samples; i += advConfig.channels) {
-            // Выделяем только высокие частоты (хрип)
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             float hf = audioData[i];
-            if (i + advConfig.channels < samples) {
-                hf = hf - 0.7f * audioData[i - advConfig.channels];  // уже было, но явно
+            // Исправлено: проверяем, что i >= NUM_CHANNELS перед обращением назад
+            if (i >= NUM_CHANNELS) {
+                hf = hf - 0.7f * audioData[i - NUM_CHANNELS];
             }
-
             float absHf = fabsf(hf);
-            env = std::max(env * (1.0f - release), absHf);   // быстрый envelope
-
+            env = std::max(env * (1.0f - release), absHf);
             if (env > hfThreshold) {
                 float gain = hfThreshold / (env + 1e-8f);
-                audioData[i] *= gain * 0.4f;   // сильно режем именно хрип
+                audioData[i] *= gain * 0.35f;
             }
         }
     }
 }
 void AdvancedAudioProcessor::ApplyDynamicEQ(float* audioData, int samples) {
-    float thresholdLinear = DbToLinear(advConfig.harshThreshold);
+    float thresholdLinear = AudioUtils::DbToLinear(advConfig.harshThreshold);
     float attack = 0.2f;
     float release = 0.05f;
 
-    int frames = samples / advConfig.channels;  // Add this
+    int frames = samples / NUM_CHANNELS;  // Add this
 
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         DynamicEQState* state = &deqState[ch];
 
         // Filter to get harsh frequency content
         std::vector<float> filtered(frames);  // Use frames
         for (int i = 0; i < frames; i++) {
-            filtered[i] = audioData[ch + i * advConfig.channels];
+            filtered[i] = audioData[ch + i * NUM_CHANNELS];
         }
 
         // Apply peaking filter
@@ -550,37 +590,37 @@ void AdvancedAudioProcessor::ApplyDynamicEQ(float* audioData, int samples) {
         state->currentGain += attack * (targetGain - state->currentGain);
 
         // Update filter coefficients with new gain
-        float gainDb = LinearToDb(state->currentGain) - 6.0f;
+        float gainDb = AudioUtils::LinearToDb(state->currentGain) - 6.0f;
         CalculatePeakingEQCoeffs(deqCoeffs, advConfig.harshFreqCenter, advConfig.harshFreqQ, gainDb);
 
         // Apply filter to original signal
-        ProcessBiquad(&audioData[ch], frames, deqCoeffs, &state->filterState[ch], advConfig.channels);  // Fix state and add stride
+        ProcessBiquad(&audioData[ch], frames, deqCoeffs, &state->filterState[ch], NUM_CHANNELS);  // Fix state and add stride
     }
 
     {
         std::lock_guard<std::mutex> lock(advStatsMutex);
-        advStats.dynamicEQGain = LinearToDb(deqState[0].currentGain);
+        advStats.dynamicEQGain = AudioUtils::LinearToDb(deqState[0].currentGain);
     }
 }
 
 void AdvancedAudioProcessor::ApplyVAD(const float* audioData, int samples) {
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         VADState* state = &vadState[ch];
 
         float energy = 0.0f;
-        int frameSize = samples / advConfig.channels;
+        int frameSize = samples / NUM_CHANNELS;
         for (int i = 0; i < frameSize; i++) {
-            int idx = ch + i * advConfig.channels;
+            int idx = ch + i * NUM_CHANNELS;
             if (idx < samples) energy += audioData[idx] * audioData[idx];
         }
         energy = sqrtf(energy / (frameSize + 1e-8f));
 
         state->energy = 0.68f * state->energy + 0.32f * energy;
 
-        float thresholdLinear = DbToLinear(advConfig.vadThreshold);
+        float thresholdLinear = AudioUtils::DbToLinear(advConfig.vadThreshold);
 
         // === БЛОКИРОВКА ГРОМКОГО ШУМА ===
-        bool isImpulse = (energy > DbToLinear(-10.0f) &&
+        bool isImpulse = (energy > AudioUtils::DbToLinear(-10.0f) &&
             (energy / (state->energy + 1e-8f) > 7.0f));
 
         if (isImpulse) {
@@ -620,90 +660,6 @@ AdvancedAudioProcessor::AdvancedStats AdvancedAudioProcessor::GetAdvancedStats()
     return s;
 }
 
-// FFT implementation (simplified Cooley-Tukey)
-void AdvancedAudioProcessor::ComputeFFT(const float* input, std::complex<float>* output, int size) {
-    // Copy input
-    for (int i = 0; i < size; i++) {
-        output[i] = std::complex<float>(input[i], 0.0f);
-    }
-    
-    // Bit-reverse
-    BitReverse(output, size);
-    
-    // FFT stages
-    for (int stage = 1; stage < size; stage <<= 1) {
-        float angle = -PI / stage;
-        std::complex<float> wlen(cosf(angle), sinf(angle));
-        
-        for (int i = 0; i < size; i += (stage << 1)) {
-            std::complex<float> w(1.0f, 0.0f);
-            
-            for (int j = 0; j < stage; j++) {
-                std::complex<float> u = output[i + j];
-                std::complex<float> v = output[i + j + stage] * w;
-                
-                output[i + j] = u + v;
-                output[i + j + stage] = u - v;
-                
-                w *= wlen;
-            }
-        }
-    }
-}
-
-void AdvancedAudioProcessor::BitReverse(std::complex<float>* data, int n) {
-    int j = 0;
-    for (int i = 1; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) {
-            j ^= bit;
-        }
-        j ^= bit;
-        
-        if (i < j) {
-            std::swap(data[i], data[j]);
-        }
-    }
-}
-// ============================================================================
-// COMPUTE IFFT (обратное FFT) — нужно для спектрального подавления шума
-// ============================================================================
-void AdvancedAudioProcessor::ComputeIFFT(const std::complex<float>* input, float* output, int size) {
-    std::vector<std::complex<float>> data(size);
-    for (int i = 0; i < size; i++) {
-        data[i] = input[i];
-    }
-
-    // Bit-reverse (тот же, что в FFT)
-    BitReverse(data.data(), size);
-
-    // IFFT стадии (угол + вместо -)
-    for (int stage = 1; stage < size; stage <<= 1) {
-        float angle = PI / stage;                     // + вместо -
-        std::complex<float> wlen(cosf(angle), sinf(angle));
-
-        for (int i = 0; i < size; i += (stage << 1)) {
-            std::complex<float> w(1.0f, 0.0f);
-
-            for (int j = 0; j < stage; j++) {
-                std::complex<float> u = data[i + j];
-                std::complex<float> v = data[i + j + stage] * w;
-
-                data[i + j] = u + v;
-                data[i + j + stage] = u - v;
-
-                w *= wlen;
-            }
-        }
-    }
-
-    // Нормализация + извлечение реальной части
-    float scale = 1.0f / size;
-    for (int i = 0; i < size; i++) {
-        output[i] = data[i].real() * scale;
-    }
-}
-
 // ============================================================================
 // UPDATE NOISE PROFILE — собирает профиль шума в паузах
 // ============================================================================
@@ -723,44 +679,127 @@ void AdvancedAudioProcessor::UpdateNoiseProfile(const std::vector<float>& magnit
 // ============================================================================
 // COMPUTE SPECTRAL GAIN — рассчитывает коэффициенты подавления шума
 // ============================================================================
+//std::vector<float> AdvancedAudioProcessor::ComputeSpectralGain(const std::vector<float>& magnitude) {
+//    std::vector<float> gain(magnitude.size(), 1.0f);
+//    // Минимальный gain – чем выше, тем меньше артефактов (но больше остаточного шума)
+//    const float minGain = 0.35f;   // было 0.15 – поднимите до 0.35
+//    const float smoothingTime = 0.85f; // межкадровое сглаживание (0.7-0.9)
+//
+//    // Статические переменные для хранения предыдущего gain (добавьте в класс AdvancedAudioProcessor)
+//    static std::vector<float> prevGain;
+//    if (prevGain.size() != magnitude.size()) {
+//        prevGain.assign(magnitude.size(), 1.0f);
+//    }
+//
+//    for (size_t i = 0; i < magnitude.size(); i++) {
+//        float noise = noiseProfile[i] * advConfig.nsReductionAmount;
+//        if (magnitude[i] > noise) {
+//            float ratio = (magnitude[i] - noise) / (magnitude[i] + 1e-8f);
+//            gain[i] = std::pow(ratio, advConfig.nsSmoothingFactor);
+//            gain[i] = std::max(minGain, gain[i]);
+//        }
+//        else {
+//            gain[i] = minGain;
+//        }
+//    }
+//
+//    // === 1. Межкадровое сглаживание (экспоненциальное) ===
+//    for (size_t i = 0; i < gain.size(); i++) {
+//        gain[i] = smoothingTime * prevGain[i] + (1.0f - smoothingTime) * gain[i];
+//        prevGain[i] = gain[i];
+//    }
+//
+//    // === 2. Частотное сглаживание (скользящее среднее по 5 бинам) ===
+//    std::vector<float> smoothed(gain.size());
+//    int window = 5;
+//    for (size_t i = 0; i < gain.size(); i++) {
+//        float sum = 0.0f;
+//        int count = 0;
+//        for (int j = -window / 2; j <= window / 2; j++) {
+//            int idx = (int)i + j;
+//            if (idx >= 0 && idx < (int)gain.size()) {
+//                sum += gain[idx];
+//                count++;
+//            }
+//        }
+//        smoothed[i] = sum / count;
+//    }
+//
+//    return smoothed;
+//}
 std::vector<float> AdvancedAudioProcessor::ComputeSpectralGain(const std::vector<float>& magnitude) {
     std::vector<float> gain(magnitude.size(), 1.0f);
-    // Минимальный уровень подавления (около -16dB). Не глушим в абсолютный ноль!
-    // Это сохраняет естественность голоса и убирает артефакты "бульканья".
-    const float minGain = 0.15f; // Это -16dB. Шум будет слышен очень тихо, 
-    // но голос перестанет быть "рваным".
+    const float minGain = 0.05f;            // -26 dB – минимальное подавление
+    const float overSubtraction = 1.8f;     // коэффициент переподвычитания
+    const float floorGain = 0.15f;          // -16 dB – потолок подавления
+
+    // Динамическая оценка SNR для адаптации over-subtraction
+    float avgMag = 0.0f;
+    for (float m : magnitude) avgMag += m;
+    avgMag /= magnitude.size();
+    float avgNoise = 0.0f;
+    for (float n : noiseProfile) avgNoise += n;
+    avgNoise /= noiseProfile.size();
+    float snrEst = avgMag / (avgNoise + 1e-8f);
+
+    // Если SNR высокий, уменьшаем overSubtraction
+    float alpha = (snrEst > 5.0f) ? 1.2f : overSubtraction;
 
     for (size_t i = 0; i < magnitude.size(); i++) {
-        float noise = noiseProfile[i] * advConfig.nsReductionAmount;
-        if (magnitude[i] > noise) {
-            float ratio = (magnitude[i] - noise) / (magnitude[i] + 1e-8f);
-            gain[i] = std::pow(ratio, advConfig.nsSmoothingFactor);
-            gain[i] = std::max(minGain, gain[i]);
-        }
-        else {
-            gain[i] = minGain;
-        }
-    }
-    return gain;
-}
+        // Оценка шума с флорингом (минимальный уровень)
+        float noise = noiseProfile[i];
+        noise = std::max(noise, 1e-6f);
 
+        // Спектральное вычитание
+        float clean = magnitude[i] - alpha * noise;
+        if (clean < 0.0f) clean = floorGain * magnitude[i];
+
+        // Соотношение сигнал/шум после вычитания
+        float postSNR = clean / (noise + 1e-8f);
+
+        // Фильтр Винера (аппроксимация)
+        gain[i] = postSNR / (postSNR + 1.0f);
+        gain[i] = std::max(minGain, std::min(1.0f, gain[i]));
+    }
+
+    // --- Сглаживание для устранения музыкального шума ---
+
+    // 1. Медианная фильтрация по частоте (окно 3 бина)
+    std::vector<float> medianFiltered(gain.size());
+    for (size_t i = 1; i < gain.size() - 1; i++) {
+        std::array<float, 3> neighbours = { gain[i - 1], gain[i], gain[i + 1] };
+        std::sort(neighbours.begin(), neighbours.end());
+        medianFiltered[i] = neighbours[1];
+    }
+    medianFiltered[0] = gain[0];
+    medianFiltered.back() = gain.back();
+
+    // 2. Рекурсивное временное сглаживание (быстрее, чем экспоненциальное)
+    const float temporalSmooth = 0.75f;
+    for (size_t i = 0; i < gain.size(); i++) {
+        medianFiltered[i] = temporalSmooth * prevGain[i] + (1.0f - temporalSmooth) * medianFiltered[i];
+        prevGain[i] = medianFiltered[i];
+    }
+
+    return medianFiltered;
+}
 // ============================================================================
 // APPLY LOOKAHEAD LIMITER — улучшенная версия (без переполнения стека)
 // ============================================================================
 void AdvancedAudioProcessor::ApplyLookaheadLimiter(float* audioData, int samples) {
-    float ceilingLinear = DbToLinear(advConfig.limiterCeiling);
-    float releaseCoeff = 1.0f - expf(-1000.0f / (10.0f * advConfig.sampleRate));
+    float ceilingLinear = AudioUtils::DbToLinear(advConfig.limiterCeiling);
+    float releaseCoeff = 1.0f - expf(-1000.0f / (10.0f * SAMPLE_RATE));
 
-    for (int ch = 0; ch < advConfig.channels; ch++) {
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         float peakAhead = 0.0f;
 
-        for (int i = ch; i < samples; i += advConfig.channels) {
+        for (int i = ch; i < samples; i += NUM_CHANNELS) {
             // Смотрим вперёд на lookaheadSamples
             peakAhead = fabsf(audioData[i]);
-            int look = std::min(advConfig.lookaheadSamples, (samples - i - 1) / advConfig.channels);
+            int look = std::min(advConfig.lookaheadSamples, (samples - i - 1) / NUM_CHANNELS);
 
             for (int j = 1; j <= look; j++) {
-                peakAhead = std::max(peakAhead, fabsf(audioData[i + j * advConfig.channels]));
+                peakAhead = std::max(peakAhead, fabsf(audioData[i + j * NUM_CHANNELS]));
             }
 
             // Применяем лимитер

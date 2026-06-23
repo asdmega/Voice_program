@@ -8,6 +8,8 @@
 #include <atomic>
 #include <queue>
 #include <mutex>
+#include "audio_defs.h"
+
 #pragma comment(lib, "opus.lib")
 
 // Advanced audio codec with low-latency, high-quality compression
@@ -20,9 +22,6 @@ public:
     };
 
     struct AudioConfig {
-        int sampleRate = 48000;           // 48 kHz for high quality
-        int channels = 2;                 // Stereo
-        int frameSize = 960;              // 10ms at 48kHz
         int targetBitrate = 32000;        // 32 kbps default
         BitrateMode bitrateMode = BitrateMode::VARIABLE;
         int complexity = 9;               // 0-10, higher = better quality but more CPU
@@ -51,7 +50,7 @@ public:
     std::vector<uint8_t> Encode(const std::vector<int16_t>& pcmData);
 
     // Decode Opus to PCM
-    std::vector<int16_t> Decode(const std::vector<uint8_t>& opusData, int frameSize);
+    std::vector<int16_t> Decode(const std::vector<uint8_t>& opusData);
 
     // Set bitrate dynamically
     void SetBitrate(int bitrate);

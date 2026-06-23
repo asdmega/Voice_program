@@ -7,7 +7,7 @@
 #include <numeric>
 #include <mutex>
 #include <complex>
-
+#include <array>
 // === КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ для устранения прерывистой речи ===
 // 1. minVoiceConfidence снижен с 0.55 до 0.35 (не обрывает речь)
 // 2. voiceHangoverMs увеличен с 200 до 400 мс (дольше держим голос)
@@ -17,14 +17,6 @@
 class VoiceDetector {
 public:
     struct DetectorConfig {
-        int sampleRate = 48000;
-        int channels = 1;
-        int frameSize = 480;
-
-        // Увеличенный FFT для лучшего разрешения
-        int fftSize = 2048;   // Было 1024
-        int hopSize = 480;    // Было 256
-
         // РАСШИРЕННЫЙ диапазон голоса - весь спектр речи
         float voiceFreqLow = 70.0f;      // Было 85
         float voiceFreqHigh = 4000.0f;   // Было 255 (!!!) - ключевое изменение
@@ -46,6 +38,14 @@ public:
         float tonalityThreshold = 4.0f;      // Было 8 - ловим свист/звон
         float frictionThreshold = 0.25f;     // Было 0.4 - ловим трение
         float plosiveThreshold = 6.0f;       // Было 12 - ловим щелчки
+
+
+        float weightLowFreqRatio = -0.25f;     // отрицательный – штраф за низкочастотный гул
+        float weightSpectralCentroid = 0.20f;  // чем выше центроид, тем больше похоже на речь
+        float weightZeroCrossing = 0.15f;      // прямая связь
+
+        // Порог для определения «узкого» пика
+        float formantPeakMinWidthHz = 100.0f;   // пик шире 150 Гц – кандидат в форманту
     };
 
     struct VoiceFeatures {
@@ -59,6 +59,10 @@ public:
         float formant1Strength = 0.0f;
         float formant2Strength = 0.0f;
         float zeroCrossingRate = 0.0f;
+
+        // Пункт 5: ширина формантных пиков (на -3dB)
+        float formant1Width = 0.0f;   // ширина пика вокруг formant1 (в Гц)
+        float formant2Width = 0.0f;   // ширина пика вокруг formant2
 
         // Метрики для подавления шума
         float impulseMetric = 0.0f;      // Стук, кашель
@@ -85,6 +89,33 @@ public:
 
         std::string rejectionReason;       // Почему отклонено
     };
+    // Структура для скользящей статистики (метод Уэлфорда)
+    struct FeatureStats {
+        float mean = 0.0f;
+        float variance = 0.0f;
+        int count = 0;
+
+        void Update(float x) {
+            count++;
+            float delta = x - mean;
+            mean += delta / count;
+            float delta2 = x - mean;
+            variance += delta * delta2;
+        }
+
+        float GetStdDev() const {
+            if (count < 2) return 1.0f;
+            return std::sqrt(variance / (count - 1) + 1e-8f);
+        }
+
+        float Normalize(float x) const {
+            float sd = GetStdDev();
+            if (sd < 1e-6f) return 0.0f;
+            return (x - mean) / sd;
+        }
+    };
+
+    std::array<FeatureStats, 9> featureStats; // для каждого используемого признака
 
 
     VoiceDetector();
@@ -135,24 +166,22 @@ private:
     int consecutiveNoiseFrames_ = 0;
     int consecutiveVoiceFrames_ = 0;
 
-
-    // FFT реализация (Cooley-Tukey) - объявления методов без std::vector<std::complex<float>>
-    void ComputeFFT(const std::vector<float>& input, std::vector<std::complex<float>>& output);
-    void BitReverse(std::vector<std::complex<float>>& data);
-
     // Извлечение признаков
     VoiceFeatures ExtractFeatures(const std::vector<float>& frame);
 
     // Обновление профиля шума
     void UpdateNoiseProfile(const VoiceFeatures& features, const std::vector<float>& spectrum);
 
+    void UpdateFeatureStats(const VoiceFeatures& f, bool isNoiseFrame);
+
     // Принятие решения
     bool ClassifyVoice(const VoiceFeatures& features, float& confidence);
 
-    // Утилиты
-    float LinearToDb(float linear) const;
-    float DbToLinear(float db) const;
+   
     float CalculateHarmonicRatio(const std::vector<float>& spectrum, float fundamental);
     float DetectFormant(const std::vector<float>& spectrum, float centerFreq, float bandwidth);
     
+    float EstimateFundamental(const std::vector<float>& spectrum, float binWidth);
+
 };
+

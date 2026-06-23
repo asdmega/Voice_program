@@ -3,8 +3,11 @@
 
 #include "audio_processor.h"
 #include "voice_detector.h"
+#include "adaptive_noise_suppression.h"
+#include "distance_analyzer.h"
 #include <complex>
 #include <vector>
+#include <memory>
 
 // Advanced Audio Processor with professional-grade algorithms
 // Includes: Spectral Noise Suppression, Multiband De-esser, Lookahead Limiter
@@ -91,8 +94,6 @@ public:
     void StartCalibration();
     bool IsCalibrated() const;
     int GetCalibrationProgress() const;
-    bool IsVoiceDetected() const;
-    float GetVoiceConfidence() const;
     struct VoiceDetectorStats {
         bool isVoice = false;
         float confidence = 0.0f;
@@ -119,17 +120,23 @@ public:
     float dynamicVADConfidence = 0.30f;            // порог уверенности VAD
     float dynamicNoiseGateThreshold = -38.0f;
     float dynamicAGCTargetLevel = -18.0f;
-
+    // В protected или public секции:
+    void ApplyImpulseSuppressor(float* data, int samples);
     // Дополнительно (рекомендую)
     float dynamicDeesserThreshold = -22.0f;
 protected:
+    std::vector<float> prevGain;   // для временного сглаживания в ComputeSpectralGain
+    std::vector<float> prevSpectralGain;   // для межкадрового сглаживания
+    float spectralGainSmoothing = 0.7f;    // коэффициент сглаживания (0-1)
     std::unique_ptr<VoiceDetector> voiceDetector_;
+    std::unique_ptr<AdaptiveNoiseSuppression> noiseSuppressor_;
+    std::unique_ptr<DistanceAnalyzer> distanceAnalyzer_;
 
     mutable std::mutex advStatsMutex;
 
     // Spectral processing
-    static constexpr int SPECTRAL_FFT_SIZE = 1024;
-    static constexpr int SPECTRAL_HOP_SIZE = 256;
+    static constexpr int SPECTRAL_FFT_SIZE = 2048;
+    static constexpr int SPECTRAL_HOP_SIZE = 512;
     static constexpr int SPECTRAL_OVERLAP = 4;
     
     std::vector<float> spectralWindow;
@@ -182,8 +189,6 @@ protected:
     // Private methods
     void InitializeSpectralProcessing();
     void ApplySpectralNoiseSuppression(float* audioData, int samples);
-    void ComputeFFT(const float* input, std::complex<float>* output, int size);
-    void ComputeIFFT(const std::complex<float>* input, float* output, int size);
     void UpdateNoiseProfile(const std::vector<float>& magnitude);
     std::vector<float> ComputeSpectralGain(const std::vector<float>& magnitude);
     
@@ -201,11 +206,5 @@ protected:
     void CalculatePeakingEQCoeffs(float* coeffs, float freq, float q, float gainDb);
     
     void ApplyVAD(const float* audioData, int samples);
-    
-    // Bit reversal for FFT
-    void BitReverse(std::complex<float>* data, int n);
-    
-
-    
 
 };

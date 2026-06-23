@@ -26,15 +26,22 @@ public:
     struct NetworkPacket {
         PacketType type = PacketType::DATA;
         uint32_t sequenceNumber = 0;
-        uint32_t groupNumber = 0;      // For FEC grouping
-        uint8_t packetIndex = 0;       // Index within group
+        uint32_t groupNumber = 0;
+        uint8_t packetIndex = 0;
         std::vector<uint8_t> payload;
         int64_t timestamp = 0;
         uint16_t checksum = 0;
-        int priority = 0;              // 0=low, 1=normal, 2=high
-        
-        // Serialized header size (32 bytes)
-        static constexpr int HEADER_SIZE = 32;
+        int priority = 0;
+
+        static constexpr size_t HEADER_SIZE =
+            sizeof(PacketType) + sizeof(uint32_t) + sizeof(uint32_t) +
+            sizeof(uint8_t) + sizeof(int64_t) + sizeof(uint16_t) + sizeof(int);
+
+        // Сериализация в вектор байт (константный метод)
+        std::vector<uint8_t> Serialize() const;
+
+        // Статическая десериализация из вектора байт
+        static NetworkPacket Deserialize(const std::vector<uint8_t>& data);
     };
 
     struct ReliabilityConfig {
@@ -95,6 +102,7 @@ public:
     };
 
     TransportStatistics GetStatistics() const;
+    bool VerifyChecksum(const NetworkPacket& packet);
 
 private:
     ReliabilityConfig config;
@@ -128,7 +136,6 @@ private:
 
     // Helper functions
     uint16_t CalculateChecksum(const NetworkPacket& packet);
-    bool VerifyChecksum(const NetworkPacket& packet);
     NetworkPacket SerializeData(
         const std::vector<uint8_t>& data,
         uint32_t sequenceNumber,

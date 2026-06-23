@@ -16,10 +16,7 @@ void VoiceApplicationFramework::InitializeAudioProcessor() {
         advancedProcessor = std::make_unique<AdvancedAudioProcessor>();
         
         AdvancedAudioProcessor::AdvancedConfig advConfig;
-        advConfig.sampleRate = config.audioSampleRate;
-        advConfig.channels = config.audioChannels;
-        advConfig.frameSize = config.audioSampleRate * config.audioFrameSizeMs / 1000;
-        
+
         // Configure noise gate for quiet voice
         advConfig.enableNoiseGate = true;
         advConfig.noiseGateThreshold = config.noiseGateThreshold;
@@ -69,10 +66,7 @@ void VoiceApplicationFramework::InitializeAudioProcessor() {
         audioProcessor = std::make_unique<AudioProcessor>();
         
         AudioProcessor::ProcessorConfig procConfig;
-        procConfig.sampleRate = config.audioSampleRate;
-        procConfig.channels = config.audioChannels;
-        procConfig.frameSize = config.audioSampleRate * config.audioFrameSizeMs / 1000;
-        
+
         procConfig.enableNoiseGate = true;
         procConfig.noiseGateThreshold = config.noiseGateThreshold;
         procConfig.enableAGC = true;
@@ -101,9 +95,6 @@ bool VoiceApplicationFramework::Initialize(const FrameworkConfig& cfg) {
     // Initialize audio codec
     audioCodec = std::make_unique<AdvancedAudioCodec>();
     AdvancedAudioCodec::AudioConfig audioConfig;
-    audioConfig.sampleRate = config.audioSampleRate;
-    audioConfig.channels = config.audioChannels;
-    audioConfig.frameSize = config.audioSampleRate * config.audioFrameSizeMs / 1000;
     audioConfig.targetBitrate = config.audioTargetBitrate;
     audioConfig.complexity = 9;
     audioConfig.enableFEC = true;
@@ -259,8 +250,22 @@ std::vector<int16_t> VoiceApplicationFramework::DecodeAudio(const std::vector<ui
         return std::vector<int16_t>();
     }
 
-    int frameSize = config.audioSampleRate * config.audioFrameSizeMs / 1000;
-    return audioCodec->Decode(compressedData, frameSize);
+    return audioCodec->Decode(compressedData);
+}
+
+float VoiceDetector::EstimateFundamental(const std::vector<float>& spectrum, float binWidth) {
+    float maxPeak = 0.0f;
+    int maxBin = 50; // начало от 50 Гц
+    for (int i = 50; i < 200; i++) { // диапазон 50..200 Гц для мужских, можно расширить
+        if (spectrum[i] > maxPeak) {
+            maxPeak = spectrum[i];
+            maxBin = i;
+        }
+    }
+    // Поиск гармоник
+    float f0 = maxBin * binWidth;
+    // Уточнение по максимуму автокорреляции (упрощённо)
+    return f0;
 }
 
 bool VoiceApplicationFramework::SendAudioPacket(
